@@ -26,7 +26,13 @@ export class JobsService implements OnModuleInit, OnModuleDestroy {
   constructor(private readonly db: DatabaseService, private readonly config: ConfigService) {}
 
   async onModuleInit() {
-    this.connection = new IORedis(this.config.getOrThrow('REDIS_URL'), { maxRetriesPerRequest: null });
+    const redisUrl = this.config.get('REDIS_URL');
+    if (!redisUrl) {
+      this.log.warn('REDIS_URL not configured - background jobs will be disabled');
+      return;
+    }
+
+    this.connection = new IORedis(redisUrl, { maxRetriesPerRequest: null });
     this.queue = new Queue('lifecycle', { connection: this.connection });
 
     const every = async (name: string, pattern: string) =>
@@ -215,9 +221,11 @@ export class JobsService implements OnModuleInit, OnModuleDestroy {
   }
 
   async onModuleDestroy() {
-    await this.worker?.close();
-    await this.queue?.close();
-    await this.connection?.quit();
+    if (this.connection) {
+      await this.worker?.close();
+      await this.queue?.close();
+      await this.connection?.quit();
+    }
   }
 }
 
