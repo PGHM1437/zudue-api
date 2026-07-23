@@ -33,8 +33,6 @@ services:
         value: ""
       - key: RAZORPAY_WEBHOOK_SECRET
         value: ""
-      - key: REDIS_URL
-        value: ""
       - key: S3_ENDPOINT
         value: ""
       - key: S3_REGION
