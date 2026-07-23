@@ -29,6 +29,26 @@ export class DatabaseService implements OnModuleDestroy {
     this.client = postgres(databaseUrl, {
       max: 20,
       prepare: false, // pooled (pgbouncer/Neon) — transaction pooling safe
+
+      // Every money column in this schema is `bigint` (paise). postgres.js
+      // returns int8 as a STRING by default to avoid precision loss, so
+      // balance_paise arrived at the client as "0" rather than 0 and every
+      // `as num` cast threw:
+      //     TypeError: "0": type 'String' is not a subtype of type 'num'
+      // That hit every screen showing money, not just the wallet.
+      //
+      // Parsing to Number is safe here: JS integers are exact to 2^53, i.e.
+      // ~90 trillion rupees in paise — orders of magnitude beyond any real
+      // balance. Fixing it at the driver keeps a single source of truth
+      // instead of scattering String→num coercions across the clients.
+      types: {
+        bigint: {
+          to: 20,
+          from: [20], // int8 OID
+          serialize: (x: number | bigint) => x.toString(),
+          parse: (x: string) => Number(x),
+        },
+      },
     });
     this.db = drizzle(this.client, { schema });
   }
