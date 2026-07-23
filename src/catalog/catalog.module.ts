@@ -18,7 +18,17 @@ class CatalogService {
 
   setService(userId: string, b: { type: string; duration?: string | null; pricePaise: number; active?: boolean }) {
     return this.db.runAs(userId, (tx) =>
-      this.db.rpc(tx, 'rpc_partner_set_service', [userId, b.type, b.duration ?? null, b.pricePaise, b.active ?? true]));
+      // type/duration are enum-typed args. A driver-typed `text` fails function
+      // resolution ("rpc_partner_set_service(uuid, text, ...) does not exist"),
+      // which surfaced as the 500 on saving a service. Cast explicitly, and let
+      // a NULL duration stay untyped since NULL needs no enum coercion.
+      this.db.rpc(tx, 'rpc_partner_set_service', [
+        userId,
+        sql`${b.type}::public.service_type_enum` as any,
+        b.duration ? (sql`${b.duration}::public.call_duration_options_enum` as any) : null,
+        b.pricePaise,
+        b.active ?? true,
+      ]));
   }
 
   /** Own links, including unapproved ones (RLS social_public_read allows the
@@ -57,6 +67,28 @@ class CatalogService {
     });
   }
 
+  /** The creator's own categories — drives discovery filtering. */
+  myCategories(userId: string) {
+    return this.db.runAs(userId, async (tx) =>
+      (await tx.execute(sql`
+        select c.slug, c.name
+        from public.partner_categories pc
+        join public.categories c on c.id = pc.category_id
+        where pc.partner_id = ${userId}
+        order by c.sort_order
+      `)) as unknown as any[]);
+  }
+
+  /** Replace-all: the client sends the full set, matching a multi-select UI.
+   *  Slug validation and the 3-category cap live in the RPC. */
+  setCategories(userId: string, slugs: string[]) {
+    if (!Array.isArray(slugs)) throw new BadRequestException('slugs must be an array');
+    return this.db.runAs(userId, (tx) =>
+      this.db.rpc(tx, 'rpc_partner_set_categories', [
+        userId, sql`${slugs}::text[]` as any,
+      ]));
+  }
+
   removeSocialLink(userId: string, id: string) {
     return this.db.runAs(userId, async (tx) => {
       await tx.execute(sql`delete from public.partner_social_links where id = ${id} and partner_id = ${userId}`);
@@ -70,6 +102,10 @@ class CatalogController {
   constructor(private readonly svc: CatalogService) {}
   @UseGuards(JwtGuard) @Get('services') list(@CurrentUser() u: AuthUser) { return this.svc.myServices(u.id); }
   @UseGuards(JwtGuard) @Post('services') set(@CurrentUser() u: AuthUser, @Body() b: any) { return this.svc.setService(u.id, b); }
+  @UseGuards(JwtGuard) @Get('categories') listCategories(@CurrentUser() u: AuthUser) { return this.svc.myCategories(u.id); }
+  @UseGuards(JwtGuard) @Post('categories') setCategories(@CurrentUser() u: AuthUser, @Body('slugs') slugs: string[]) {
+    return this.svc.setCategories(u.id, slugs ?? []);
+  }
   @UseGuards(JwtGuard) @Get('social-links') listSocial(@CurrentUser() u: AuthUser) { return this.svc.mySocialLinks(u.id); }
   @UseGuards(JwtGuard) @Post('social-links') social(@CurrentUser() u: AuthUser, @Body() b: any) { return this.svc.setSocialLink(u.id, b); }
   @UseGuards(JwtGuard) @Delete('social-links/:id') delSocial(@CurrentUser() u: AuthUser, @Param('id') id: string) { return this.svc.removeSocialLink(u.id, id); }
