@@ -8,7 +8,8 @@
     "start:dev": "nest start --watch",
     "db:migrate": "node ./scripts/migrate.mjs && node ./scripts/db-doctor.mjs",
     "db:doctor": "node ./scripts/db-doctor.mjs",
-    "test": "jest"
+    "test": "jest",
+    "make:admin": "node ./scripts/make-admin.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.658.0",

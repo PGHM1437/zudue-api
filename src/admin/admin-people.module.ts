@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Injectable, Module, Param, Post, Query, UseGuards } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Get, Injectable, Module, Param, Post, Query, UseGuards } from '@nestjs/common';
 import { sql } from 'drizzle-orm';
 import { DatabaseService } from '../db/database.service';
 import { JwtGuard } from '../auth/jwt.guard';
@@ -18,6 +18,21 @@ class AdminPeopleService {
   partners(userId: string) {
     return this.db.runAs(userId, async (tx) =>
       (await tx.execute(sql`select * from public.vw_admin_manage_partners order by created_at desc limit 500`)) as unknown as any[]);
+  }
+
+  /**
+   * Promote a fan to creator, or revert. Replaces the public "Become a creator"
+   * self-signup: role is an operator decision, and routing it through admin is
+   * what stops application spam. SUPER_ADMIN only (enforced in the RPC).
+   */
+  setUserRole(userId: string, targetUserId: string, role: 'FAN' | 'PARTNER', reason?: string) {
+    if (role !== 'FAN' && role !== 'PARTNER') {
+      throw new BadRequestException('role must be FAN or PARTNER');
+    }
+    return this.db.runAs(userId, (tx) =>
+      this.db.rpc(tx, 'rpc_admin_set_user_role', [
+        userId, targetUserId, sql`${role}::public.user_role` as any, reason ?? null,
+      ]));
   }
 
   setAccountStatus(userId: string, targetUserId: string, status: string, reason?: string) {
@@ -118,6 +133,10 @@ class AdminPeopleController {
 
   @UseGuards(JwtGuard, AdminGuard) @Get('fans') fans(@CurrentUser() u: AuthUser) { return this.svc.fans(u.id); }
   @UseGuards(JwtGuard, AdminGuard) @Get('partners') partners(@CurrentUser() u: AuthUser) { return this.svc.partners(u.id); }
+  @UseGuards(JwtGuard, AdminGuard) @Post('users/:id/role')
+  setRole(@CurrentUser() u: AuthUser, @Param('id') id: string, @Body() b: { role: 'FAN' | 'PARTNER'; reason?: string }) {
+    return this.svc.setUserRole(u.id, id, b.role, b.reason);
+  }
   @UseGuards(JwtGuard, AdminGuard) @Post('users/:id/status')
   setStatus(@CurrentUser() u: AuthUser, @Param('id') id: string, @Body() b: { status: string; reason?: string }) {
     return this.svc.setAccountStatus(u.id, id, b.status, b.reason);
