@@ -20,9 +20,17 @@ export class JwtGuard implements CanActivate {
   private readonly audience: string;
 
   constructor(config: ConfigService) {
-    this.jwks = createRemoteJWKSet(new URL(config.getOrThrow('AUTH_JWKS_URL')));
-    this.issuer = config.getOrThrow('AUTH_ISSUER');
-    this.audience = config.getOrThrow('AUTH_AUDIENCE');
+    const jwksUrl = config.get<string>('AUTH_JWKS_URL');
+    const issuer = config.get<string>('AUTH_ISSUER');
+    const audience = config.get<string>('AUTH_AUDIENCE');
+    
+    if (!jwksUrl || !issuer || !audience) {
+      throw new Error('AUTH_JWKS_URL, AUTH_ISSUER, and AUTH_AUDIENCE must be configured');
+    }
+    
+    this.jwks = createRemoteJWKSet(new URL(jwksUrl));
+    this.issuer = issuer;
+    this.audience = audience;
   }
 
   async canActivate(ctx: ExecutionContext): Promise<boolean> {
