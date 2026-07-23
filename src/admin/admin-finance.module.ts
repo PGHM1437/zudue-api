@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Module, Param, Post, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Injectable, Module, Param, Post, Query, UseGuards } from '@nestjs/common';
 import { sql } from 'drizzle-orm';
 import { DatabaseService } from '../db/database.service';
 import { JwtGuard } from '../auth/jwt.guard';
@@ -12,6 +12,7 @@ import { AdminGuard } from './admin.guard';
  * shape as their 0030 originals (verified live against production, not just
  * the migration file, before writing these).
  */
+@Injectable()
 class AdminFinanceService {
   constructor(private readonly db: DatabaseService) {}
 

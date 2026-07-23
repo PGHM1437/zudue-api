@@ -1,4 +1,4 @@
-import { BadRequestException, Body, Controller, Get, Module, Param, Post, Query, UseGuards } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Get, Injectable, Module, Param, Post, Query, UseGuards } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { sql } from 'drizzle-orm';
 import { RtcTokenBuilder, RtcRole } from 'agora-token';
@@ -14,6 +14,7 @@ import { AuthUser, CurrentUser } from '../auth/current-user.decorator';
  * service adds the Agora token (rented) and exposes read models. Stalled/missed
  * sweeps live in JobsModule (BullMQ), not here.
  */
+@Injectable()
 class CallsService {
   constructor(
     private readonly db: DatabaseService,

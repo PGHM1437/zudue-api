@@ -1,4 +1,4 @@
-import { Controller, Get, Module, UseGuards } from '@nestjs/common';
+import { Controller, Get, Injectable, Module, UseGuards } from '@nestjs/common';
 import { sql } from 'drizzle-orm';
 import { DatabaseService } from '../db/database.service';
 import { JwtGuard } from '../auth/jwt.guard';
@@ -11,6 +11,7 @@ import { AdminGuard } from './admin.guard';
  * this replicates its exact shape as a live query, per that migration's own
  * instruction, not a guess at what the dashboard should show.
  */
+@Injectable()
 class AdminDashboardService {
   constructor(private readonly db: DatabaseService) {}
 

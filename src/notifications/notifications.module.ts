@@ -1,9 +1,10 @@
-import { Controller, Get, Module, Param, Post, UseGuards } from '@nestjs/common';
+import { Controller, Get, Injectable, Module, Param, Post, UseGuards } from '@nestjs/common';
 import { sql } from 'drizzle-orm';
 import { DatabaseService } from '../db/database.service';
 import { JwtGuard } from '../auth/jwt.guard';
 import { AuthUser, CurrentUser } from '../auth/current-user.decorator';
 
+@Injectable()
 class NotificationsService {
   constructor(private readonly db: DatabaseService) {}
 

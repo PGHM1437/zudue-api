@@ -1,4 +1,4 @@
-import { Body, Controller, Module, Post, UseGuards } from '@nestjs/common';
+import { Body, Controller, Injectable, Module, Post, UseGuards } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import { JwtGuard } from '../auth/jwt.guard';
 import { AuthUser, CurrentUser } from '../auth/current-user.decorator';
@@ -20,6 +20,7 @@ const PURPOSE_TO_BUCKET: Record<UploadPurpose, StorageBucket> = {
  * NOT generic (see ShoutoutsService.videoUrl) because reading someone else's
  * paid-for content needs a business-rule check, not just a namespace check.
  */
+@Injectable()
 class StorageService {
   constructor(private readonly storage: StorageProvider) {}
 

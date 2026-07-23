@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Module, Param, Post, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Injectable, Module, Param, Post, UseGuards } from '@nestjs/common';
 import { sql } from 'drizzle-orm';
 import { DatabaseService } from '../db/database.service';
 import { JwtGuard } from '../auth/jwt.guard';
@@ -9,6 +9,7 @@ import { AuthUser, CurrentUser } from '../auth/current-user.decorator';
  * StorageModule), admin reviews the video, and emails it to the fan directly.
  * There is no fan-facing "watch" endpoint — the app only reflects status.
  */
+@Injectable()
 class ShoutoutsService {
   constructor(private readonly db: DatabaseService) {}
 

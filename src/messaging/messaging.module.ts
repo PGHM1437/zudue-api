@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Module, Param, Post, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Injectable, Module, Param, Post, UseGuards } from '@nestjs/common';
 import { sql } from 'drizzle-orm';
 import { DatabaseService } from '../db/database.service';
 import { JwtGuard } from '../auth/jwt.guard';
@@ -9,6 +9,7 @@ import { AuthUser, CurrentUser } from '../auth/current-user.decorator';
  * with a 48h deadline (auto-refund via BullMQ), partner free follow-up. All
  * money/state via RPCs; block/report gating enforced in the DB.
  */
+@Injectable()
 class MessagingService {
   constructor(private readonly db: DatabaseService) {}
 

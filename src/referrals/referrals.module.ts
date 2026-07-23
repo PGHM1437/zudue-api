@@ -1,4 +1,4 @@
-import { Controller, Get, Module, UseGuards } from '@nestjs/common';
+import { Controller, Get, Injectable, Module, UseGuards } from '@nestjs/common';
 import { sql } from 'drizzle-orm';
 import { DatabaseService } from '../db/database.service';
 import { JwtGuard } from '../auth/jwt.guard';
@@ -6,6 +6,7 @@ import { AuthUser, CurrentUser } from '../auth/current-user.decorator';
 
 /** referral_code lives on profiles; crediting is rpc_credit_referral (system-gated,
  *  fired by the referee's first qualifying action — not called from here). */
+@Injectable()
 class ReferralsService {
   constructor(private readonly db: DatabaseService) {}
 

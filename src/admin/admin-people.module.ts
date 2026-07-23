@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Module, Param, Post, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Injectable, Module, Param, Post, Query, UseGuards } from '@nestjs/common';
 import { sql } from 'drizzle-orm';
 import { DatabaseService } from '../db/database.service';
 import { JwtGuard } from '../auth/jwt.guard';
@@ -6,6 +6,7 @@ import { CurrentUser, AuthUser } from '../auth/current-user.decorator';
 import { AdminGuard } from './admin.guard';
 
 /** Fans, partners, KYC, and the two-stage partner application review. */
+@Injectable()
 class AdminPeopleService {
   constructor(private readonly db: DatabaseService) {}
 

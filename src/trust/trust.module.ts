@@ -1,9 +1,10 @@
-import { BadRequestException, Body, Controller, Module, Post, UseGuards } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Injectable, Module, Post, UseGuards } from '@nestjs/common';
 import { sql } from 'drizzle-orm';
 import { DatabaseService } from '../db/database.service';
 import { JwtGuard } from '../auth/jwt.guard';
 import { AuthUser, CurrentUser } from '../auth/current-user.decorator';
 
+@Injectable()
 class TrustService {
   constructor(private readonly db: DatabaseService) {}
 

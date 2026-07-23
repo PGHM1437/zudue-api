@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Module, Param, Post, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Injectable, Module, Param, Post, UseGuards } from '@nestjs/common';
 import { sql } from 'drizzle-orm';
 import { DatabaseService } from '../db/database.service';
 import { JwtGuard } from '../auth/jwt.guard';
@@ -11,6 +11,7 @@ import { AdminGuard } from './admin.guard';
  * gates "is an admin at all"; a non-SUPER_ADMIN admin gets a clear rejection
  * from the RPC itself, same pattern as every other tiered action.
  */
+@Injectable()
 class AdminSettingsService {
   constructor(private readonly db: DatabaseService) {}
 

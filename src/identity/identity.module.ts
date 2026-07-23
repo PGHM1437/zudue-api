@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Module, Post, Put, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Injectable, Module, Post, Put, UseGuards } from '@nestjs/common';
 import { sql } from 'drizzle-orm';
 import { DatabaseService } from '../db/database.service';
 import { JwtGuard } from '../auth/jwt.guard';
@@ -37,6 +37,7 @@ const LIFECYCLE_SQL = sql`
     ), 'NEEDS_APPLICATION')
   end`;
 
+@Injectable()
 class IdentityService {
   constructor(private readonly db: DatabaseService) {}
 

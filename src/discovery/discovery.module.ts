@@ -1,4 +1,4 @@
-import { Controller, Get, Module, Param, Post, Query, UseGuards } from '@nestjs/common';
+import { Controller, Get, Injectable, Module, Param, Post, Query, UseGuards } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { sql } from 'drizzle-orm';
 import { DatabaseService } from '../db/database.service';
@@ -6,6 +6,7 @@ import { toPublicMediaUrl } from '../storage/media-url.util';
 import { JwtGuard } from '../auth/jwt.guard';
 import { AuthUser, CurrentUser } from '../auth/current-user.decorator';
 
+@Injectable()
 class DiscoveryService {
   constructor(private readonly db: DatabaseService, private readonly config: ConfigService) {}
 
