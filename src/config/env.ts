@@ -4,7 +4,7 @@ const schema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   PORT: z.coerce.number().default(3000),
   DATABASE_URL: z.string().url(),
-  REDIS_URL: z.string().url(),
+  REDIS_URL: z.string().url().optional(),
   AUTH_JWKS_URL: z.string().url(),
   AUTH_ISSUER: z.string(),
   AUTH_AUDIENCE: z.string().default('authenticated'),

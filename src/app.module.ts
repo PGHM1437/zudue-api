@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { Controller, Get, Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { DatabaseModule } from './db/database.module';
 import { AuthModule } from './auth/auth.module';
@@ -24,7 +24,16 @@ import { AdminFinanceModule } from './admin/admin-finance.module';
 import { AdminModerationModule } from './admin/admin-moderation.module';
 import { AdminSettingsModule } from './admin/admin-settings.module';
 
+@Controller()
+class HealthController {
+  @Get()
+  health() {
+    return { status: 'ok', service: 'zudue-api' };
+  }
+}
+
 @Module({
+  controllers: [HealthController],
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
     DatabaseModule,
