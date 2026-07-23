@@ -1,0 +1,51 @@
+services:
+  - type: web
+    name: zudue-api
+    runtime: node
+    region: singapore
+    plan: starter
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      - key: DATABASE_URL
+        sync: false
+      - key: SUPABASE_JWT_SECRET
+        sync: false
+      - key: AUTH_JWKS_URL
+        value: https://jlmmpdupapuknhsnudeu.supabase.co/auth/v1/.well-known/jwks.json
+      - key: AUTH_ISSUER
+        value: https://jlmmpdupapuknhsnudeu.supabase.co/auth/v1
+      - key: AUTH_AUDIENCE
+        value: authenticated
+      - key: CORS_ORIGINS
+        value: https://zudue.com,https://www.zudue.com
+      - key: AGORA_APP_ID
+        sync: false
+      - key: AGORA_APP_CERTIFICATE
+        sync: false
+      - key: RAZORPAY_KEY_ID
+        sync: false
+      - key: RAZORPAY_KEY_SECRET
+        sync: false
+      - key: RAZORPAY_WEBHOOK_SECRET
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: S3_ENDPOINT
+        sync: false
+      - key: S3_REGION
+        sync: false
+      - key: S3_ACCESS_KEY_ID
+        sync: false
+      - key: S3_SECRET_ACCESS_KEY
+        sync: false
+      - key: S3_BUCKET
+        sync: false
+      - key: FIREBASE_SERVICE_ACCOUNT
+        sync: false
+    healthCheckPath: /v1
+    autoDeploy: true
