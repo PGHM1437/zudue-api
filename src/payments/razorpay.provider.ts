@@ -17,13 +17,26 @@ export class RazorpayProvider extends PaymentProvider {
     super();
     this.keyId = config.get('RAZORPAY_KEY_ID') ?? '';
     this.webhookSecret = config.get('RAZORPAY_WEBHOOK_SECRET') ?? '';
-    this.client = new Razorpay({
-      key_id: this.keyId,
-      key_secret: config.get('RAZORPAY_KEY_SECRET') ?? '',
-    });
+    const keySecret = config.get('RAZORPAY_KEY_SECRET') ?? '';
+    
+    // Only initialize Razorpay client if credentials are provided
+    if (this.keyId && keySecret) {
+      this.client = new Razorpay({
+        key_id: this.keyId,
+        key_secret: keySecret,
+      });
+      this.log.log('Razorpay client initialized');
+    } else {
+      this.log.warn('Razorpay credentials not configured - payment features will be unavailable');
+      // @ts-ignore - Allow undefined for optional feature
+      this.client = null;
+    }
   }
 
   async createOrder(amountPaise: number, receipt: string, notes?: Record<string, string>): Promise<CreatedOrder> {
+    if (!this.client) {
+      throw new Error('Payment provider not configured');
+    }
     const order = await this.client.orders.create({
       amount: amountPaise, // Razorpay amount IS in paise
       currency: 'INR',
@@ -52,6 +65,9 @@ export class RazorpayProvider extends PaymentProvider {
   }
 
   async fetchPayment(paymentId: string): Promise<FetchedPayment> {
+    if (!this.client) {
+      throw new Error('Payment provider not configured');
+    }
     const p: any = await this.client.payments.fetch(paymentId);
     return {
       paymentId: p.id,
