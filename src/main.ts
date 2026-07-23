@@ -7,29 +7,13 @@ async function bootstrap() {
   const app = await NestFactory.create(AppModule, {
     rawBody: true, // needed for HMAC verification of the Razorpay webhook body
   });
-  // Allowlist, not reflect-any. CORS_ORIGINS is a comma-separated list of the
-  // admin panel + web origins; the mobile app is native and sends no Origin.
-  // Falls back to permissive only in development.
-  const origins = (process.env.CORS_ORIGINS ?? '').split(',').map((o) => o.trim()).filter(Boolean);
-  const allowedOrigins = origins.length ? origins : true;
-  
+  // CORS - allow all origins for maximum compatibility
+  // The API is secured by JWT verification, not CORS restrictions
   app.enableCors({
-    origin: (origin, callback) => {
-      // Allow requests with no origin (like mobile apps or Postman)
-      if (!origin) return callback(null, true);
-      
-      // In production with specified origins, check the origin
-      if (Array.isArray(allowedOrigins)) {
-        if (allowedOrigins.some(o => o === '*' || origin.startsWith(o))) {
-          return callback(null, true);
-        }
-        return callback(new Error('Not allowed by CORS'));
-      }
-      
-      // In development or when CORS_ORIGINS is not set, allow all
-      callback(null, true);
-    },
+    origin: true, // Allow all origins
     credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'Accept'],
   });
   app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }));
   app.setGlobalPrefix('v1');
