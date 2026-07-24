@@ -87,12 +87,27 @@ class IdentityService {
   updateProfile(userId: string, patch: Record<string, unknown>) {
     // Only self-editable columns; admin-only columns are blocked by the DB guard.
     return this.db.runAs(userId, async (tx) => {
-      const allowed = ['full_name', 'mobile_number', 'age', 'gender', 'notification_prefs'];
-      const sets = Object.entries(patch).filter(([k]) => allowed.includes(k));
-      if (!sets.length) return { updated: false };
-      for (const [k, v] of sets) {
-        await tx.execute(sql`update public.profiles set ${sql.identifier(k)} = ${v as any}, updated_at = now() where id = ${userId}`);
-      }
+      // Each column needs the right type at the bind site, because two of these
+      // are NOT plain text and drizzle mis-serialises them, which 500'd the
+      // whole PUT /me:
+      //   gender             -> gender_enum. A string bound as `text` fails enum
+      //                         resolution; cast explicitly.
+      //   notification_prefs -> jsonb. A JS object bound directly renders as a
+      //                         record, not jsonb; stringify + ::jsonb.
+      const setters: Record<string, (v: unknown) => any> = {
+        full_name: (v) => sql`full_name = ${String(v)}`,
+        mobile_number: (v) => sql`mobile_number = ${String(v)}`,
+        age: (v) => sql`age = ${v === null || v === '' ? null : Number(v)}`,
+        gender: (v) => sql`gender = ${v == null ? null : sql`${v}::public.gender_enum`}`,
+        notification_prefs: (v) => sql`notification_prefs = ${JSON.stringify(v)}::jsonb`,
+      };
+      const parts = Object.entries(patch)
+        .filter(([k]) => k in setters)
+        .map(([k, v]) => setters[k](v));
+      if (!parts.length) return { updated: false };
+      await tx.execute(
+        sql`update public.profiles set ${sql.join(parts, sql`, `)}, updated_at = now() where id = ${userId}`,
+      );
       return { updated: true };
     });
   }

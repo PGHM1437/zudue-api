@@ -1,4 +1,4 @@
-import { Injectable, OnModuleDestroy } from '@nestjs/common';
+import { BadRequestException, Injectable, OnModuleDestroy } from '@nestjs/common';
 import { drizzle, PostgresJsDatabase } from 'drizzle-orm/postgres-js';
 import { sql } from 'drizzle-orm';
 import postgres from 'postgres';
@@ -94,9 +94,12 @@ export class DatabaseService implements OnModuleDestroy {
     )) as unknown as Array<{ result: T }>;
     const result = res[0]?.result as any;
     if (result && result.success === false) {
-      const err = new Error(result.error ?? 'RPC_FAILED');
-      (err as any).rpc = result;
-      throw err;
+      // A business rejection (PARTNER_NOT_ACTIVE, NO_CAPACITY, ALREADY_VERIFIED…)
+      // is the CLIENT's condition to fix, not a server fault — so surface it as
+      // a 400 carrying the DB's error code, not a generic 500. Previously this
+      // threw a plain Error, which NestJS rendered as "Internal server error",
+      // hiding the actual reason from the app.
+      throw new BadRequestException({ error: result.error ?? 'RPC_FAILED', ...result });
     }
     return result as T;
   }

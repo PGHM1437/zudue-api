@@ -22,14 +22,29 @@ class CallsService {
     private readonly push: PushService,
   ) {}
 
+  // service_type_enum and call_duration_options_enum args must be cast at the
+  // bind site — a driver-typed `text` fails function resolution, which is what
+  // 500'd both preview and booking. Same fix as services/markMissed/cancel.
   previewPrice(userId: string, partnerId: string, duration: string, promo?: string) {
     return this.db.runAs(userId, (tx) =>
-      this.db.rpc(tx, 'rpc_preview_price', [partnerId, 'VIDEO_CALL', duration, promo ?? null]));
+      this.db.rpc(tx, 'rpc_preview_price', [
+        partnerId,
+        sql`'VIDEO_CALL'::public.service_type_enum` as any,
+        sql`${duration}::public.call_duration_options_enum` as any,
+        promo ?? null,
+      ]));
   }
 
   book(userId: string, b: { partnerId: string; date: string; duration: string; note?: string; promo?: string }) {
     return this.db.runAs(userId, (tx) =>
-      this.db.rpc(tx, 'rpc_book_video_call', [userId, b.partnerId, b.date, b.duration, b.note ?? null, b.promo ?? null]));
+      this.db.rpc(tx, 'rpc_book_video_call', [
+        userId,
+        b.partnerId,
+        sql`${b.date}::date` as any,
+        sql`${b.duration}::public.call_duration_options_enum` as any,
+        b.note ?? null,
+        b.promo ?? null,
+      ]));
   }
 
   myBookings(userId: string) {
