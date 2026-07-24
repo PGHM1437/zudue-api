@@ -52,9 +52,14 @@ class CatalogService {
     if (!CatalogService.PLATFORMS.includes(b?.platform)) {
       throw new BadRequestException(`platform must be one of ${CatalogService.PLATFORMS.join(', ')}`);
     }
-    const url = b?.url?.trim() ?? '';
-    if (!/^https?:\/\/.+\..+/i.test(url)) {
-      throw new BadRequestException('url must be a valid http(s) link');
+    // People type "instagram.com/handle", not "https://instagram.com/handle".
+    // Requiring the scheme rejected the natural input (this 400'd on
+    // "efrfrf.com"). Prepend https:// when missing, then sanity-check it looks
+    // like a domain rather than demanding the user know URL syntax.
+    let url = b?.url?.trim() ?? '';
+    if (url && !/^https?:\/\//i.test(url)) url = `https://${url}`;
+    if (!/^https?:\/\/[^\s.]+\.[^\s]+$/i.test(url)) {
+      throw new BadRequestException('Enter a valid link, e.g. instagram.com/yourname');
     }
     return this.db.runAs(userId, async (tx) => {
       await tx.execute(sql`
@@ -83,10 +88,15 @@ class CatalogService {
    *  Slug validation and the 3-category cap live in the RPC. */
   setCategories(userId: string, slugs: string[]) {
     if (!Array.isArray(slugs)) throw new BadRequestException('slugs must be an array');
+    // Build the array with an explicit ARRAY[...] constructor. Interpolating a
+    // JS array as `${slugs}::text[]` does NOT work: drizzle renders a JS array
+    // as a record `('a','b')`, and casting a record to text[] fails with
+    // "cannot cast type record to text[]". This 500'd the categories save.
+    const arr = slugs.length
+      ? sql`ARRAY[${sql.join(slugs.map((s) => sql`${s}`), sql`, `)}]::text[]`
+      : sql`ARRAY[]::text[]`;
     return this.db.runAs(userId, (tx) =>
-      this.db.rpc(tx, 'rpc_partner_set_categories', [
-        userId, sql`${slugs}::text[]` as any,
-      ]));
+      this.db.rpc(tx, 'rpc_partner_set_categories', [userId, arr as any]));
   }
 
   removeSocialLink(userId: string, id: string) {
