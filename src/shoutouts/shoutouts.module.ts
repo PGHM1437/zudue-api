@@ -5,9 +5,10 @@ import { JwtGuard } from '../auth/jwt.guard';
 import { AuthUser, CurrentUser } from '../auth/current-user.decorator';
 
 /**
- * Shout-out delivery is out-of-app: the partner uploads to R2 (see
- * StorageModule), admin reviews the video, and emails it to the fan directly.
- * There is no fan-facing "watch" endpoint — the app only reflects status.
+ * Shout-out delivery is admin-monitored and offline: the partner submits a
+ * video LINK (e.g. a Drive URL), it goes to the admin for review, and the admin
+ * sends it to the fan directly. The partner never delivers to the fan. There is
+ * no fan-facing "watch" endpoint — the app only reflects status.
  */
 @Injectable()
 class ShoutoutsService {
@@ -16,7 +17,7 @@ class ShoutoutsService {
   request(userId: string, b: { partnerId: string; recipient: string; message: string }) {
     return this.db.runAs(userId, (tx) => this.db.rpc(tx, 'rpc_request_shoutout', [userId, b.partnerId, b.recipient, b.message]));
   }
-  /** Partner uploads the finished video (R2 key) — admin reviews it before it's emailed out. */
+  /** Partner submits the finished video's link — admin reviews it before it's sent to the fan. */
   upload(userId: string, id: string, videoPath: string) {
     return this.db.runAs(userId, (tx) => this.db.rpc(tx, 'rpc_upload_shoutout', [id, videoPath]));
   }

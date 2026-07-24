@@ -32,6 +32,16 @@ class AdminModerationService {
     return this.db.runAs(userId, (tx) => this.db.rpc(tx, 'rpc_admin_resolve_shoutout_report', [userId, shoutoutId, action, notes ?? null]));
   }
 
+  /**
+   * Review a partner-submitted shout-out video. Delivery is offline (the admin
+   * emails/sends the video); this records the outcome. approve → delivered to
+   * fan (which lets settlement pay the creator); reject → back to the partner
+   * with a note to resubmit.
+   */
+  deliverShoutout(userId: string, shoutoutId: string, approve: boolean, note?: string) {
+    return this.db.runAs(userId, (tx) => this.db.rpc(tx, 'rpc_admin_deliver_shoutout', [userId, shoutoutId, approve, note ?? null]));
+  }
+
   // ── Content oversight ──
   videoCalls(userId: string) {
     return this.db.runAs(userId, async (tx) =>
@@ -62,6 +72,10 @@ class AdminModerationController {
   @UseGuards(JwtGuard, AdminGuard) @Post('shoutouts/:id/resolve-report')
   resolveShoutoutReport(@CurrentUser() u: AuthUser, @Param('id') id: string, @Body() b: { action: string; notes?: string }) {
     return this.svc.resolveShoutoutReport(u.id, id, b.action, b.notes);
+  }
+  @UseGuards(JwtGuard, AdminGuard) @Post('shoutouts/:id/deliver')
+  deliverShoutout(@CurrentUser() u: AuthUser, @Param('id') id: string, @Body() b: { approve: boolean; note?: string }) {
+    return this.svc.deliverShoutout(u.id, id, b.approve, b.note);
   }
 
   @UseGuards(JwtGuard, AdminGuard) @Get('video-calls') videoCalls(@CurrentUser() u: AuthUser) { return this.svc.videoCalls(u.id); }

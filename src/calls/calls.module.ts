@@ -77,6 +77,24 @@ class CallsService {
   }
 
   /**
+   * Partner's upcoming calls — booked for a FUTURE date, so not yet actionable
+   * in the queue (which is today only). Just a heads-up list on the dashboard.
+   */
+  partnerUpcoming(userId: string) {
+    return this.db.runAs(userId, async (tx) =>
+      (await tx.execute(sql`
+        select b.id, b.fan_id, p.full_name as fan_name, b.scheduled_date,
+               b.selected_duration, b.price_paise, b.status
+        from public.bookings b join public.profiles p on p.id = b.fan_id
+        where b.partner_id = ${userId}
+          and b.status = 'BOOKED'
+          and b.scheduled_date > current_date
+        order by b.scheduled_date asc, b.created_at asc
+        limit 100
+      `)) as unknown as any[]);
+  }
+
+  /**
    * Fan self-service cancellation → full refund to wallet, booking cancelled,
    * and the partner's booked_minutes released (all inside the RPC's own
    * transaction). The RPC enforces the rest: assert_caller(fan), status must
@@ -176,6 +194,7 @@ class CallsController {
   @UseGuards(JwtGuard) @Get('bookings') bookings(@CurrentUser() u: AuthUser) { return this.svc.myBookings(u.id); }
   @UseGuards(JwtGuard) @Get('queue') queue(@CurrentUser() u: AuthUser) { return this.svc.partnerQueue(u.id); }
   @UseGuards(JwtGuard) @Get('history') history(@CurrentUser() u: AuthUser) { return this.svc.partnerHistory(u.id); }
+  @UseGuards(JwtGuard) @Get('upcoming') upcoming(@CurrentUser() u: AuthUser) { return this.svc.partnerUpcoming(u.id); }
   @UseGuards(JwtGuard) @Post(':bookingId/cancel') cancel(@CurrentUser() u: AuthUser, @Param('bookingId') id: string) { return this.svc.cancelBooking(u.id, id); }
   @UseGuards(JwtGuard) @Post(':bookingId/ready') ready(@CurrentUser() u: AuthUser, @Param('bookingId') id: string) { return this.svc.signalReady(u.id, id); }
   @UseGuards(JwtGuard) @Post(':bookingId/initiate') init(@CurrentUser() u: AuthUser, @Param('bookingId') id: string) { return this.svc.initiate(u.id, id); }
