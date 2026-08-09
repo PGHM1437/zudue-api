@@ -3,7 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import * as crypto from 'crypto';
 import Razorpay from 'razorpay';
 import {
-  CreatedOrder, FetchedPayment, PayoutResult, PaymentProvider,
+  CreatedOrder, FetchedPayment, PaymentProvider,
 } from './payment-provider.interface';
 
 @Injectable()
@@ -75,12 +75,5 @@ export class RazorpayProvider extends PaymentProvider {
       amountPaise: Number(p.amount),
       status: p.status,
     };
-  }
-
-  async createPayout(amountPaise: number, methodRef: string, reference: string): Promise<PayoutResult> {
-    // RazorpayX fund-account payout. Requires RAZORPAYX_ACCOUNT_NUMBER + a
-    // fund_account_id (methodRef). Left as a typed integration point.
-    this.log.warn(`createPayout(${reference}) — wire RazorpayX fund account ${methodRef}`);
-    throw new Error('RAZORPAYX_PAYOUT_NOT_CONFIGURED');
   }
 }

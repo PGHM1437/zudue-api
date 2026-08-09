@@ -33,13 +33,48 @@ class AdminModerationService {
   }
 
   /**
-   * Review a partner-submitted shout-out video. Delivery is offline (the admin
-   * emails/sends the video); this records the outcome. approve → delivered to
-   * fan (which lets settlement pay the creator); reject → back to the partner
-   * with a note to resubmit.
+   * Force-confirm or send back a delivered shout-out (repurposed in 0061).
+   * approve → force-confirm the delivery (partner will be credited even if
+   * the fan is unhappy); reject → admin rework round back to the partner.
    */
   deliverShoutout(userId: string, shoutoutId: string, approve: boolean, note?: string) {
     return this.db.runAs(userId, (tx) => this.db.rpc(tx, 'rpc_admin_deliver_shoutout', [userId, shoutoutId, approve, note ?? null]));
+  }
+
+  /**
+   * The ONLY cancellation path (0061): full refund — price + every paid
+   * correction fee — escrow → fan wallet, blocked once settled.
+   * FINANCE/SUPER_ADMIN only (gated inside the RPC).
+   */
+  cancelShoutout(userId: string, shoutoutId: string, notes?: string) {
+    return this.db.runAs(userId, (tx) => this.db.rpc(tx, 'rpc_admin_cancel_shoutout', [userId, shoutoutId, notes ?? null]));
+  }
+
+  /**
+   * Admin escape hatch: manually expire a stuck booking with a specific status.
+   * Forces the booking into one of the EXPIRED_* states or COMPLETED_SUCCESSFUL,
+   * triggering refund if applicable. Use when automated expiry logic failed or
+   * the booking is trapped in BOOKED status.
+   * 
+   * Logic moved to DB function rpc_admin_expire_booking (migration 0063).
+   */
+  expireBooking(userId: string, bookingId: string, status: string) {
+    return this.db.runAs(userId, (tx) => 
+      this.db.rpc(tx, 'rpc_admin_expire_booking', [userId, bookingId, status])
+    );
+  }
+
+  /**
+   * Admin escape hatch: manually settle a booking or other service immediately,
+   * bypassing the 7-day window. Use for stuck bookings past their settle_at
+   * that the automated settlement job missed or for immediate payout needs.
+   * 
+   * Logic moved to DB function rpc_admin_force_settle_booking (migration 0063).
+   */
+  forceSettleBooking(userId: string, bookingId: string) {
+    return this.db.runAs(userId, (tx) => 
+      this.db.rpc(tx, 'rpc_admin_force_settle_booking', [userId, bookingId])
+    );
   }
 
   // ── Content oversight ──
@@ -76,6 +111,20 @@ class AdminModerationController {
   @UseGuards(JwtGuard, AdminGuard) @Post('shoutouts/:id/deliver')
   deliverShoutout(@CurrentUser() u: AuthUser, @Param('id') id: string, @Body() b: { approve: boolean; note?: string }) {
     return this.svc.deliverShoutout(u.id, id, b.approve, b.note);
+  }
+  @UseGuards(JwtGuard, AdminGuard) @Post('shoutouts/:id/cancel')
+  cancelShoutout(@CurrentUser() u: AuthUser, @Param('id') id: string, @Body() b: { notes?: string }) {
+    return this.svc.cancelShoutout(u.id, id, b.notes);
+  }
+
+  @UseGuards(JwtGuard, AdminGuard) @Post('bookings/:id/expire')
+  expireBooking(@CurrentUser() u: AuthUser, @Param('id') id: string, @Body('status') status: string) {
+    return this.svc.expireBooking(u.id, id, status);
+  }
+
+  @UseGuards(JwtGuard, AdminGuard) @Post('bookings/:id/force-settle')
+  forceSettleBooking(@CurrentUser() u: AuthUser, @Param('id') id: string) {
+    return this.svc.forceSettleBooking(u.id, id);
   }
 
   @UseGuards(JwtGuard, AdminGuard) @Get('video-calls') videoCalls(@CurrentUser() u: AuthUser) { return this.svc.videoCalls(u.id); }

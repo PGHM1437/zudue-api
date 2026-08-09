@@ -4,11 +4,16 @@ import { DatabaseService } from '../db/database.service';
 import { JwtGuard } from '../auth/jwt.guard';
 import { CurrentUser, AuthUser } from '../auth/current-user.decorator';
 import { AdminGuard } from './admin.guard';
+import { StorageModule } from '../storage/storage.module';
+import { StorageProvider } from '../storage/storage-provider.interface';
 
 /** Fans, partners, KYC, and the two-stage partner application review. */
 @Injectable()
 class AdminPeopleService {
-  constructor(private readonly db: DatabaseService) {}
+  constructor(
+    private readonly db: DatabaseService,
+    private readonly storage: StorageProvider,
+  ) {}
 
   fans(userId: string) {
     return this.db.runAs(userId, async (tx) =>
@@ -60,6 +65,26 @@ class AdminPeopleService {
 
   decideKyc(userId: string, targetUserId: string, verified: boolean, reason?: string) {
     return this.db.runAs(userId, (tx) => this.db.rpc(tx, 'rpc_admin_manage_kyc', [userId, targetUserId, verified, reason ?? null]));
+  }
+
+  /** Signed, short-lived URLs for one user's submitted KYC files — the read
+   *  half that was missing: uploads and the private `kyc` bucket always
+   *  worked, but nothing ever turned a stored key into something an admin
+   *  could open. RLS (`kyc_owner`) already allows admin cross-profile reads,
+   *  so this only needed the presign call, not a DB change. */
+  async kycDocuments(userId: string, targetUserId: string) {
+    const docs = await this.db.runAs(userId, async (tx) =>
+      (await tx.execute(sql`
+        select document_type, storage_path, file_name, uploaded_at
+        from public.kyc_documents where profile_id = ${targetUserId}
+        order by uploaded_at
+      `)) as unknown as Array<{ document_type: string; storage_path: string; file_name: string | null; uploaded_at: string }>);
+    return Promise.all(docs.map(async (d) => ({
+      type: d.document_type,
+      fileName: d.file_name,
+      uploadedAt: d.uploaded_at,
+      url: await this.storage.getDownloadUrl('kyc', d.storage_path),
+    })));
   }
 
   // ── Partner applications (two-stage) ──
@@ -144,6 +169,8 @@ class AdminPeopleController {
 
   @UseGuards(JwtGuard, AdminGuard) @Get('kyc/pending') pendingKyc(@CurrentUser() u: AuthUser) { return this.svc.pendingKyc(u.id); }
   @UseGuards(JwtGuard, AdminGuard) @Get('kyc') allKyc(@CurrentUser() u: AuthUser) { return this.svc.allKyc(u.id); }
+  @UseGuards(JwtGuard, AdminGuard) @Get('kyc/:id/documents')
+  kycDocuments(@CurrentUser() u: AuthUser, @Param('id') id: string) { return this.svc.kycDocuments(u.id, id); }
   @UseGuards(JwtGuard, AdminGuard) @Post('kyc/:id/decision')
   decideKyc(@CurrentUser() u: AuthUser, @Param('id') id: string, @Body() b: { verified: boolean; reason?: string }) {
     return this.svc.decideKyc(u.id, id, b.verified, b.reason);
@@ -189,5 +216,5 @@ class AdminPeopleController {
   }
 }
 
-@Module({ controllers: [AdminPeopleController], providers: [AdminPeopleService] })
+@Module({ imports: [StorageModule], controllers: [AdminPeopleController], providers: [AdminPeopleService] })
 export class AdminPeopleModule {}

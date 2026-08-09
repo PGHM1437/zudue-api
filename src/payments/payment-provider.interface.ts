@@ -12,14 +12,14 @@ export interface FetchedPayment {
   status: 'created' | 'authorized' | 'captured' | 'refunded' | 'failed';
 }
 
-export interface PayoutResult {
-  payoutId: string;
-  status: 'queued' | 'processing' | 'processed' | 'reversed' | 'failed';
-}
-
 /**
  * Abstracts the payment gateway so a second provider (Stripe for global) slots
  * in without touching the wallet domain. Razorpay is the India implementation.
+ *
+ * Money OUT (partner payouts) is deliberately NOT part of this interface:
+ * payouts are on-demand and processed offline (admin sends the bank/UPI
+ * transfer by hand, then records the UTR via rpc_process_payout) — there is
+ * no automated payout gateway integration by design.
  */
 export abstract class PaymentProvider {
   /** Create a checkout order for `amountPaise` (money IN). */
@@ -30,7 +30,4 @@ export abstract class PaymentProvider {
 
   /** Cross-check a payment with the provider's API (never trust the client). */
   abstract fetchPayment(paymentId: string): Promise<FetchedPayment>;
-
-  /** Money OUT — partner payout (RazorpayX). */
-  abstract createPayout(amountPaise: number, methodRef: string, reference: string): Promise<PayoutResult>;
 }

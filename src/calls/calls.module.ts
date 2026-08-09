@@ -109,9 +109,20 @@ class CallsService {
    * ("function rpc_refund_booking(uuid, text) does not exist"), and whether it
    * arrives untyped is a driver implementation detail, not a guarantee.
    */
-  cancelBooking(userId: string, bookingId: string) {
-    return this.db.runAs(userId, (tx) =>
-      this.db.rpc(tx, 'rpc_refund_booking', [bookingId, sql`'FAN_CANCEL'::public.refund_reason` as any]));
+  async cancelBooking(userId: string, bookingId: string) {
+    return this.db.runAs(userId, async (tx) => {
+      const res = await this.db.rpc(tx, 'rpc_refund_booking', [bookingId, sql`'FAN_CANCEL'::public.refund_reason` as any]);
+      if (res?.success) {
+        // Booking status stays BOOKED while a call is ringing (only calls.attempt_status
+        // moves to PARTNER_INITIATED), so this refund can land mid-ring — stop it on
+        // every registered device, not just the one the fan used to cancel from.
+        const rows = (await tx.execute(sql`
+          select id from public.calls where booking_id = ${bookingId} and attempt_status in ('PARTNER_INITIATED','IN_PROGRESS')
+        `)) as unknown as Array<{ id: string }>;
+        for (const c of rows) this.push.cancelCall(userId, c.id).catch(() => undefined);
+      }
+      return res;
+    });
   }
 
   signalReady(userId: string, bookingId: string) {
@@ -162,8 +173,18 @@ class CallsService {
     if (!CallsService.MISSED_STATUSES.includes(status)) {
       throw new BadRequestException(`status must be one of ${CallsService.MISSED_STATUSES.join(', ')}`);
     }
-    return this.db.runAs(userId, (tx) =>
-      this.db.rpc(tx, 'rpc_mark_call_missed', [callId, sql`${status}::public.call_status` as any]));
+    return this.db.runAs(userId, async (tx) => {
+      const res = await this.db.rpc(tx, 'rpc_mark_call_missed', [callId, sql`${status}::public.call_status` as any]);
+      if (res?.success) {
+        // Covers the partner declining/dropping a still-ringing call, and the
+        // stalled-call sweep. The fan's own CallKit decline/timeout also calls
+        // this endpoint — cancelCall back to that same device is a harmless
+        // no-op (endCall on an already-dismissed ring).
+        const rows = (await tx.execute(sql`select fan_id from public.calls where id = ${callId}`)) as unknown as Array<{ fan_id: string }>;
+        if (rows[0]) this.push.cancelCall(rows[0].fan_id, callId).catch(() => undefined);
+      }
+      return res;
+    });
   }
 
   /** Short-lived Agora RTC token for a meeting the caller is a party to. */

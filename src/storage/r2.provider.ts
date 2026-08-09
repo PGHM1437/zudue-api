@@ -62,7 +62,7 @@ export class R2Provider extends StorageProvider {
     return getSignedUrl(
       this.client,
       new GetObjectCommand({ Bucket: this.buckets[bucket], Key: key }),
-      { expiresIn: 900 }, // 15 min — enough to load a doc or stream a shout-out video
+      { expiresIn: 900 }, // 15 min — enough to load a KYC document
     );
   }
 }

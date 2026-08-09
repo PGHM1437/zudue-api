@@ -1,9 +1,12 @@
 import { Body, Controller, Get, Injectable, Module, Param, Post, UseGuards } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { sql } from 'drizzle-orm';
 import { DatabaseService } from '../db/database.service';
 import { JwtGuard } from '../auth/jwt.guard';
 import { CurrentUser, AuthUser } from '../auth/current-user.decorator';
 import { AdminGuard } from './admin.guard';
+import { JobsService } from '../jobs/jobs.module';
+import { JobsModule } from '../jobs/jobs.module';
 
 /**
  * Admin-user management. The DB enforces SUPER_ADMIN-only via
@@ -13,7 +16,11 @@ import { AdminGuard } from './admin.guard';
  */
 @Injectable()
 class AdminSettingsService {
-  constructor(private readonly db: DatabaseService) {}
+  constructor(
+    private readonly db: DatabaseService,
+    private readonly config: ConfigService,
+    private readonly jobs: JobsService
+  ) {}
 
   /** Admins + their tier, for the settings screen's admin-list table. */
   admins(userId: string) {
@@ -44,7 +51,7 @@ class AdminSettingsService {
         select gst_rate, default_commission_rate,
                min_wallet_topup_paise, max_wallet_topup_paise, max_wallet_balance_paise,
                min_withdrawal_paise, settlement_window_days, question_sla_hours,
-               payout_day_of_month, referral_referrer_reward_paise, referral_referee_reward_paise,
+               referral_referrer_reward_paise, referral_referee_reward_paise,
                referral_budget_remaining_paise, is_referral_program_active, min_service_prices,
                updated_at, last_updated_by_admin_id
         from public.platform_settings where id = 1
@@ -57,6 +64,21 @@ class AdminSettingsService {
   updatePlatformSettings(userId: string, patch: Record<string, unknown>) {
     return this.db.runAs(userId, (tx) =>
       this.db.rpc(tx, 'rpc_admin_update_settings', [sql`${JSON.stringify(patch)}::jsonb` as any]));
+  }
+
+  /**
+   * BullMQ monitoring - Redis connection status and scheduled jobs.
+   * This exposes the internal state of the background job scheduler.
+   */
+  bullmqStatus(userId: string) {
+    const redisUrl = this.config.get('REDIS_URL');
+    
+    return {
+      redis_url_set: !!redisUrl,
+      redis_connected: this.jobs.isJobRunning(),
+      queue_connected: this.jobs.isJobRunning(),
+      jobs: this.jobs.getJobs(),
+    };
   }
 }
 
@@ -79,7 +101,15 @@ class AdminSettingsController {
   updatePlatform(@CurrentUser() u: AuthUser, @Body() b: Record<string, unknown>) {
     return this.svc.updatePlatformSettings(u.id, b);
   }
+  @UseGuards(JwtGuard, AdminGuard) @Get('bullmq') bullmq(@CurrentUser() u: AuthUser) {
+    return this.svc.bullmqStatus(u.id);
+  }
 }
 
-@Module({ controllers: [AdminSettingsController], providers: [AdminSettingsService] })
+@Module({ 
+  imports: [JobsModule],
+  controllers: [AdminSettingsController], 
+  providers: [AdminSettingsService], 
+  exports: [AdminSettingsService] 
+})
 export class AdminSettingsModule {}

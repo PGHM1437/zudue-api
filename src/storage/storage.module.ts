@@ -5,20 +5,26 @@ import { AuthUser, CurrentUser } from '../auth/current-user.decorator';
 import { R2Provider } from './r2.provider';
 import { StorageBucket, StorageProvider } from './storage-provider.interface';
 
-type UploadPurpose = 'kyc' | 'shoutout_video' | 'profile_photo';
+type UploadPurpose = 'kyc' | 'profile_photo';
 
 const PURPOSE_TO_BUCKET: Record<UploadPurpose, StorageBucket> = {
   kyc: 'kyc',
-  shoutout_video: 'media',
   profile_photo: 'media',
 };
 
 /**
  * Generic, purpose-namespaced presigned upload. The key is always rooted at
  * `${purpose}/${callerId}/...` so a user can only ever get a writable URL into
- * their OWN namespace — there is no way to pass an arbitrary key. Downloads are
- * NOT generic (see ShoutoutsService.videoUrl) because reading someone else's
- * paid-for content needs a business-rule check, not just a namespace check.
+ * their OWN namespace — there is no way to pass an arbitrary key.
+ *
+ * Shout-out video delivery does NOT go through this module: the partner pastes
+ * an externally-hosted link (e.g. Google Drive) directly into
+ * `delivered_video_link`, and fans/admins open it as-is — no platform storage
+ * or signed URL involved.
+ *
+ * `kyc` is the only purpose whose files need to be read back later (by an
+ * admin reviewing a submission). That read path doesn't exist yet —
+ * R2Provider.getDownloadUrl is implemented but has no caller.
  */
 @Injectable()
 class StorageService {

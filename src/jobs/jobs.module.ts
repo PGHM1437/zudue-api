@@ -25,6 +25,21 @@ export class JobsService implements OnModuleInit, OnModuleDestroy {
 
   constructor(private readonly db: DatabaseService, private readonly config: ConfigService) {}
 
+  // ── Public methods for BullMQ monitoring ───────────────────────────────────
+  isJobRunning(): boolean {
+    return this.connection ? this.connection.status === 'ready' : false;
+  }
+
+  getJobs() {
+    return {
+      settle: { pattern: '*/15 * * * *' },
+      'stalled-calls': { pattern: '* * * * *' },
+      'expire-windows': { pattern: '*/15 * * * *' },
+      'purge-deletions': { pattern: '0 3 * * *' },
+    };
+  }
+
+  // ── OnModuleInit implementation ────────────────────────────────────────────
   async onModuleInit() {
     const redisUrl = this.config.get('REDIS_URL');
     if (!redisUrl) {
@@ -41,7 +56,14 @@ export class JobsService implements OnModuleInit, OnModuleDestroy {
     await every('stalled-calls', '* * * * *');
     await every('expire-windows', '*/15 * * * *');
     await every('purge-deletions', '0 3 * * *');
-    await every('monthly-payouts', '0 6 * * *');
+    // Payouts are on-demand and processed offline (admin transfers by hand,
+    // then records the UTR) — no scheduled batching. Clean up old repeatable
+    // job from Redis if it exists (harmless if already gone).
+    try {
+      await this.queue.removeRepeatableByKey('lifecycle:monthly-payouts::0 6 * * *');
+    } catch {
+      // Key format may vary; ignore if not found
+    }
 
     this.worker = new Worker('lifecycle', (job) => this.run(job.name), { connection: this.connection, concurrency: 4 });
     this.worker.on('failed', (job, err) => this.log.error(`job ${job?.name} failed: ${err.message}`));
@@ -54,7 +76,6 @@ export class JobsService implements OnModuleInit, OnModuleDestroy {
       case 'stalled-calls': return this.stalledCalls();
       case 'expire-windows': return this.expireWindows();
       case 'purge-deletions': return this.purgeDeletions();
-      case 'monthly-payouts': return this.monthlyPayouts();
       default: return Promise.resolve();
     }
   }
@@ -87,6 +108,14 @@ export class JobsService implements OnModuleInit, OnModuleDestroy {
 
   /** Day-7 settle: fulfilled bookings + answered paid windows + delivered shout-outs. */
   private async settle() {
+    // CRITICAL: expire overdue bookings FIRST so they reach the correct terminal
+    // status before settlement runs. A booking stuck in 'BOOKED' past its
+    // settle_at will never match the status filter below.
+    const expiry = await this.db.runAsService((tx) => this.db.rpc(tx, 'process_end_of_day_expired_bookings', []));
+    if (expiry && typeof expiry === 'object' && 'failed' in expiry && expiry.failed > 0) {
+      this.log.error(`expire-bookings had ${expiry.failed} failures`);
+    }
+
     const bookings = await this.ids(sql`
       select id from public.bookings
       where status in ('COMPLETED_SUCCESSFUL','EXPIRED_FAN_NO_JOIN') and settle_at <= now()
@@ -101,10 +130,21 @@ export class JobsService implements OnModuleInit, OnModuleDestroy {
       limit 200`);
     const w = await this.forEachId(windows, 'settle-window', 'rpc_settle_window');
 
+    // Fan-gated lifecycle (migration 0061): deliveries the fan never acted on
+    // are auto-confirmed once their review window elapses — settlement is
+    // still double-gated on fan_confirmed_at below.
+    const dueConfirms = await this.ids(sql`
+      select id from public.shout_out_requests
+      where status='VIDEO_DELIVERED_TO_FAN' and fan_confirmed_at is null and review_deadline_at <= now()
+      limit 200`);
+    await this.forEachId(dueConfirms, 'auto-confirm-shoutout', 'rpc_auto_confirm_shoutout');
+
     // Fixed: shout-outs now actually settle (rpc_settle_shoutout, migration 0036).
+    // fan_confirmed_at gate (0061): unconfirmed deliveries never settle by timer.
     const shoutouts = await this.ids(sql`
       select id from public.shout_out_requests
       where status='VIDEO_DELIVERED_TO_FAN' and settle_at <= now()
+        and fan_confirmed_at is not null
         and not exists (select 1 from public.partner_earnings e where e.service_id = shout_out_requests.id)
       limit 200`);
     const s = await this.forEachId(shoutouts, 'settle-shoutout', 'rpc_settle_shoutout');
@@ -113,7 +153,7 @@ export class JobsService implements OnModuleInit, OnModuleDestroy {
     if (b.failed || w.failed || s.failed) this.log.error(`settle had failures: bookings=${b.failed} windows=${w.failed} shoutouts=${s.failed}`);
   }
 
-  /** IN_PROGRESS past deadline → auto-complete; stale heartbeat → drop. */
+  /** IN_PROGRESS past deadline → auto-complete; stale heartbeat → drop; PARTNER_INITIATED sweeper → DB function. */
   private async stalledCalls() {
     const past = await this.ids(sql`
       select id from public.calls where attempt_status='IN_PROGRESS' and deadline_at <= now() limit 200`);
@@ -125,8 +165,33 @@ export class JobsService implements OnModuleInit, OnModuleDestroy {
       limit 200`);
     const d = await this.forEachId(stale, 'drop-call', 'rpc_mark_call_missed', ['DROPPED_TECHNICAL_ISSUE']);
 
-    if (c.ok || c.failed || d.ok || d.failed) this.log.log(`calls — completed ${c.ok}/${c.ok + c.failed}, dropped ${d.ok}/${d.ok + d.failed}`);
+    // PARTNER_INITIATED sweeper: moved to DB function cleanup_stalled_calls() for
+    // consistency with legacy architecture (all sweeping logic in one place).
+    const sweep = await this.db.runAsService((tx) => this.db.rpc(tx, 'cleanup_stalled_calls', []));
+    const m = { ok: sweep && typeof sweep === 'object' && 'missed_fan_no_join' in sweep ? sweep.missed_fan_no_join as number : 0,
+                failed: sweep && typeof sweep === 'object' && 'failed' in sweep ? sweep.failed as number : 0 };
+
+    if (c.ok || c.failed || d.ok || d.failed || m.ok || m.failed)
+      this.log.log(`calls — completed ${c.ok}/${c.ok + c.failed}, dropped ${d.ok}/${d.ok + d.failed}, missed ${m.ok}/${m.ok + m.failed}`);
   }
+
+  /**
+   * The 7-day expiry orchestrator — checks bookings past their settle_at and
+   * maps them to the correct EXPIRED_* or COMPLETED status based on call history.
+   * Business logic (matches legacy process_end_of_day_expired_bookings):
+   *  - Any call >= 3 min (180s) → COMPLETED_SUCCESSFUL (partner earned it).
+   *  - No calls at all → EXPIRED_PARTNER_NO_SHOW (refund fan).
+   *  - MISSED_FAN_NO_JOIN → EXPIRED_FAN_NO_JOIN (refund fan).
+   *  - MISSED_FAN_DECLINED → EXPIRED_FAN_DECLINED (refund fan).
+   *  - DROPPED_TECHNICAL_ISSUE → EXPIRED_TECHNICAL_ISSUE (refund fan).
+   * For EXPIRED_* statuses: manually refunds via post_transaction + updates status.
+   * For COMPLETED_SUCCESSFUL: just updates status (no refund).
+   * Run BEFORE settle() so bookings reach terminal state before settlement.
+   * 
+   * MOVED TO DATABASE: This logic is now in migration 0062 as
+   * process_end_of_day_expired_bookings() — called via RPC in settle() above.
+   * Keeping this method signature for reference but it's no longer used.
+   */
 
   /**
    * PAID windows unanswered past their 48h deadline → refund the fan.
@@ -191,35 +256,6 @@ export class JobsService implements OnModuleInit, OnModuleDestroy {
     if (ok || failed) this.log.log(`purge — anonymised ${ok}/${ok + failed} accounts`);
   }
 
-  /** Monthly: create a payout batch per partner with pending earnings + a verified primary method. */
-  private async monthlyPayouts() {
-    const [settings] = (await this.db.runAsService((tx) =>
-      tx.execute(sql`select payout_day_of_month from public.platform_settings where id=1`))) as unknown as Array<{ payout_day_of_month: number | null }>;
-    // Day-of-month compared in IST (the business timezone), not the server's.
-    const istDay = Number(new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Kolkata', day: 'numeric' }).format(new Date()));
-    if (settings?.payout_day_of_month && istDay !== settings.payout_day_of_month) return;
-
-    const partners = await this.db.runAsService(async (tx) =>
-      (await tx.execute(sql`
-        select distinct e.partner_id, pm.id as method_id
-        from public.partner_earnings e
-        join public.payout_methods pm on pm.partner_id = e.partner_id and pm.is_verified and pm.is_primary
-        where e.status='PENDING_PAYOUT' limit 500`)) as unknown as Array<{ partner_id: string; method_id: string }>);
-
-    let ok = 0;
-    let failed = 0;
-    for (const p of partners) {
-      try {
-        await this.db.runAsService((tx) => this.db.rpc(tx, 'rpc_create_payout_batch', [p.partner_id, p.method_id]));
-        ok++;
-      } catch (e) {
-        failed++;
-        this.log.error(`payout-batch failed for ${p.partner_id}: ${(e as Error).message}`);
-      }
-    }
-    if (ok || failed) this.log.log(`monthly-payouts — batched ${ok}/${ok + failed}`);
-  }
-
   async onModuleDestroy() {
     if (this.connection) {
       await this.worker?.close();
@@ -229,5 +265,5 @@ export class JobsService implements OnModuleInit, OnModuleDestroy {
   }
 }
 
-@Module({ providers: [JobsService] })
+@Module({ providers: [JobsService], exports: [JobsService] })
 export class JobsModule {}
