@@ -47,7 +47,7 @@ services:
       # browser will block every call. Add the actual origin (e.g. the Vercel
       # preview domain) or requests fail before reaching a route.
       - key: CORS_ORIGINS
-        value: https://zudue.com,https://www.zudue.com
+        value: https://zudue.com,https://www.zudue.com,https://admin.zudue.com,https://zudue-app.vercel.app,https://zudue-2-0.vercel.app
 
       # ── Redis ─────────────────────────────────────────────────────────
       # Was absent entirely. JobsModule reads it with getOrThrow at boot, and
