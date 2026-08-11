@@ -4,8 +4,13 @@ services:
     runtime: node
     region: singapore
     plan: starter
-    buildCommand: npm install && npm run build
-    startCommand: npm start
+    # Project is a pnpm workspace (packageManager: "pnpm@9.0.0", pnpm-lock.yaml
+    # at repo root) — npm install here ignored the lockfile and could resolve
+    # a different dependency tree than the one CI tests against. Corepack ships
+    # with Node 16.9+/Render's node runtime, so `corepack enable` gets the
+    # pinned pnpm version without a separate install step.
+    buildCommand: corepack enable && pnpm install --frozen-lockfile && pnpm build
+    startCommand: pnpm start
     envVars:
       - key: NODE_ENV
         value: production

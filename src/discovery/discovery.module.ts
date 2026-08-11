@@ -1,10 +1,15 @@
-import { Controller, Get, Injectable, Module, Param, Post, Query, UseGuards } from '@nestjs/common';
+import { Controller, Get, Injectable, Module, NotFoundException, Param, ParseUUIDPipe, Post, Query, UseGuards } from '@nestjs/common';
+import { FeedQueryDto } from './discovery.dto';
 import { ConfigService } from '@nestjs/config';
 import { sql } from 'drizzle-orm';
 import { DatabaseService } from '../db/database.service';
 import { toPublicMediaUrl } from '../storage/media-url.util';
 import { JwtGuard } from '../auth/jwt.guard';
 import { AuthUser, CurrentUser } from '../auth/current-user.decorator';
+
+/** partner_profiles.profile_id is uuid — anything else must never reach a query
+ *  against it, or Postgres raises 22P02 and Nest renders it as a bare 500. */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 @Injectable()
 class DiscoveryService {
@@ -16,7 +21,14 @@ class DiscoveryService {
    * ILIKE stays index-backed rather than degrading to a seq scan. Name matches
    * outrank bio matches, then the usual featured/premium ordering applies.
    */
-  feed(category?: string, q?: string) {
+  /**
+   * `offset`-paged, not cursor-paged: the ordering is a business ranking
+   * (suggest_rank, then name), not an append-only timestamp, so there's no
+   * natural monotonic cursor column to compare against — offset is the
+   * pragmatic fit for a catalog this size. Previously hard-limited to 100
+   * with no way to see past it at all, however many creators existed.
+   */
+  feed(category?: string, q?: string, limit = 100, offset = 0) {
     const term = q?.trim();
     return this.db.runAnon(async (tx) => {
       const like = term ? `%${term}%` : null;
@@ -28,7 +40,7 @@ class DiscoveryService {
           ${category ? sql`and ${category} = any(categories)` : sql``}
           ${like ? sql`and (display_name ilike ${like} or bio ilike ${like})` : sql``}
         order by ${like ? sql`(display_name ilike ${like}) desc,` : sql``} suggest_rank, display_name
-        limit 100
+        limit ${limit} offset ${offset}
       `)) as unknown as any[];
       const publicBase = this.config.get<string>('R2_PUBLIC_MEDIA_URL');
       return rows.map((r) => ({ ...r, profile_image_path: toPublicMediaUrl(r.profile_image_path, publicBase) }));
@@ -44,7 +56,15 @@ class DiscoveryService {
       `)) as unknown as any[];
       return rows[0]?.profile_id as string | undefined;
     });
-    return this.partner(id ?? handle);
+    // The uuid fallback keeps older handle-less links working, but only when the
+    // segment actually IS a uuid. Passing an unmatched handle straight through
+    // cast it against a uuid column and threw 22P02 — so every typo'd or
+    // retired /c/<handle> link 500'd instead of reading as "no such creator".
+    const target = id ?? (UUID_RE.test(handle) ? handle : null);
+    if (!target) throw new NotFoundException('PARTNER_NOT_FOUND');
+    const profile = await this.partner(target);
+    if (!profile) throw new NotFoundException('PARTNER_NOT_FOUND');
+    return profile;
   }
 
   /** Public partner profile + live services. */
@@ -132,23 +152,30 @@ class DiscoveryService {
 class DiscoveryController {
   constructor(private readonly svc: DiscoveryService) {}
 
-  @Get() feed(@Query('category') category?: string, @Query('q') q?: string) { return this.svc.feed(category, q); }
+  @Get() feed(@Query() q: FeedQueryDto) { return this.svc.feed(q.category, q.q, q.limit, q.offset); }
   @Get('categories') categories() { return this.svc.categories(); }
   // Static segments must precede the :id catch-all or /discover/favourites
   // would be parsed as a partner id.
   @UseGuards(JwtGuard) @Get('favourites') favourites(@CurrentUser() u: AuthUser) { return this.svc.favourites(u.id); }
   @UseGuards(JwtGuard) @Get('favourites/ids') favIds(@CurrentUser() u: AuthUser) { return this.svc.myFavouriteIds(u.id); }
-  @UseGuards(JwtGuard) @Post('favourites/:partnerId') toggleFav(@CurrentUser() u: AuthUser, @Param('partnerId') id: string) {
+  // ParseUUIDPipe on every param that lands in a uuid column: without it a
+  // malformed id reached Postgres, raised 22P02 and surfaced as a bare 500.
+  // `:handle` is deliberately exempt — it is free-form text by design.
+  @UseGuards(JwtGuard) @Post('favourites/:partnerId') toggleFav(@CurrentUser() u: AuthUser, @Param('partnerId', ParseUUIDPipe) id: string) {
     return this.svc.toggleFavourite(u.id, id);
   }
-  @UseGuards(JwtGuard) @Post('waitlist/:partnerId') joinWaitlist(@CurrentUser() u: AuthUser, @Param('partnerId') id: string) {
+  @UseGuards(JwtGuard) @Post('waitlist/:partnerId') joinWaitlist(@CurrentUser() u: AuthUser, @Param('partnerId', ParseUUIDPipe) id: string) {
     return this.svc.joinWaitlist(u.id, id);
   }
-  @UseGuards(JwtGuard) @Get('waitlist/:partnerId') waitlistStatus(@CurrentUser() u: AuthUser, @Param('partnerId') id: string) {
+  @UseGuards(JwtGuard) @Get('waitlist/:partnerId') waitlistStatus(@CurrentUser() u: AuthUser, @Param('partnerId', ParseUUIDPipe) id: string) {
     return this.svc.waitlistStatus(u.id, id);
   }
   @Get('handle/:handle') byHandle(@Param('handle') handle: string) { return this.svc.byHandle(handle); }
-  @Get('partner/:id') partner(@Param('id') id: string) { return this.svc.partner(id); }
+  @Get('partner/:id') async partner(@Param('id', ParseUUIDPipe) id: string) {
+    const p = await this.svc.partner(id);
+    if (!p) throw new NotFoundException('PARTNER_NOT_FOUND');
+    return p;
+  }
 }
 
 @Module({ controllers: [DiscoveryController], providers: [DiscoveryService] })

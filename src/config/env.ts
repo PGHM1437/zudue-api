@@ -30,8 +30,18 @@ const schema = z.object({
 
 export type Env = z.infer<typeof schema>;
 
-export function loadEnv(): Env {
-  const parsed = schema.safeParse(process.env);
+/**
+ * Also usable directly as `ConfigModule.forRoot({ validate: loadEnv })` — Nest
+ * calls `validate(config)` with the merged env at boot, so this takes an
+ * optional source and defaults to `process.env` for standalone use.
+ *
+ * This schema previously existed but was never imported anywhere: `main.ts`
+ * read `process.env.PORT` directly, so a non-numeric PORT produced `NaN`
+ * passed to `app.listen()` instead of a clear startup error naming the actual
+ * misconfigured variable.
+ */
+export function loadEnv(config: Record<string, unknown> = process.env): Env {
+  const parsed = schema.safeParse(config);
   if (!parsed.success) {
     // Fail fast and loud — a misconfigured money service must not boot.
     console.error('Invalid environment:', parsed.error.flatten().fieldErrors);

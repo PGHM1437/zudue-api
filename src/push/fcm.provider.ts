@@ -36,14 +36,32 @@ export class FcmProvider {
     this.enabled = !!this.jwt && !!this.projectId;
   }
 
-  /** Data-only high-priority send to many tokens. Returns dead tokens. */
-  async sendData(tokens: string[], data: Record<string, string>, ttlSeconds = 45): Promise<string[]> {
+  /**
+   * Data-only high-priority send to many tokens. Returns dead tokens.
+   *
+   * `platform` is optional (older/backfilled rows may not have it) and
+   * defaults to 'android' — this codebase has never shipped an iOS build, so
+   * every token in production today is Android. When one isn't, the message
+   * only carries the block matching ITS platform: sending `apns-push-type:
+   * voip` to an Android token was harmless (FCM ignores blocks that don't
+   * match the token's platform), but sending it to a real iOS token would
+   * actively break delivery — VoIP pushes require a separate PushKit
+   * certificate/entitlement from a normal APNs push, which this app has never
+   * been configured for. Better to omit the block than assert a push type
+   * this app cannot actually deliver.
+   */
+  async sendData(
+    tokens: Array<{ token: string; platform?: string }>,
+    data: Record<string, string>,
+    ttlSeconds = 45,
+  ): Promise<string[]> {
     if (!this.enabled || tokens.length === 0) return [];
     const access = await this.jwt!.getAccessToken();
     const bearer = access.token;
     const dead: string[] = [];
 
-    await Promise.all(tokens.map(async (token) => {
+    await Promise.all(tokens.map(async ({ token, platform }) => {
+      const isIos = platform === 'ios';
       try {
         const res = await fetch(`https://fcm.googleapis.com/v1/projects/${this.projectId}/messages:send`, {
           method: 'POST',
@@ -52,8 +70,9 @@ export class FcmProvider {
             message: {
               token,
               data,
-              android: { priority: 'high', ttl: `${ttlSeconds}s`, direct_boot_ok: true },
-              apns: { headers: { 'apns-priority': '10', 'apns-push-type': 'voip' } },
+              ...(isIos
+                ? { apns: { headers: { 'apns-priority': '10', 'apns-push-type': 'voip' } } }
+                : { android: { priority: 'high', ttl: `${ttlSeconds}s`, direct_boot_ok: true } }),
             },
           }),
         });

@@ -1,8 +1,9 @@
-import { Body, Controller, Get, Injectable, Module, Param, Post, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Injectable, Module, Param, ParseUUIDPipe, Post, UseGuards } from '@nestjs/common';
 import { sql } from 'drizzle-orm';
 import { DatabaseService } from '../db/database.service';
 import { JwtGuard } from '../auth/jwt.guard';
 import { AuthUser, CurrentUser } from '../auth/current-user.decorator';
+import { AnswerDto, AskQuestionDto, FollowupDto } from './messaging.dto';
 
 /**
  * Messaging — bold domain. First-question-free, 5-msg free window, paid windows
@@ -83,6 +84,22 @@ class MessagingService {
       `)) as unknown as any[]);
   }
 
+  /** Single-conversation lookup by the other party's id. The mobile client
+   *  previously had no way to ask this directly and fetched the FULL
+   *  conversation list to scan for one row client-side. Not yet wired up to
+   *  the client — see zudue_api.dart / chat_screen.dart before switching over. */
+  byPartner(userId: string, partnerId: string) {
+    return this.db.runAs(userId, async (tx) => {
+      const rows = (await tx.execute(sql`
+        select id from public.conversations
+        where (fan_id = ${userId} and partner_id = ${partnerId})
+           or (partner_id = ${userId} and fan_id = ${partnerId})
+        limit 1
+      `)) as unknown as Array<{ id: string }>;
+      return rows[0] ?? null;
+    });
+  }
+
   messages(userId: string, conversationId: string) {
     return this.db.runAs(userId, async (tx) =>
       (await tx.execute(sql`
@@ -100,12 +117,14 @@ class MessagingService {
 class MessagingController {
   constructor(private readonly svc: MessagingService) {}
   @UseGuards(JwtGuard) @Get('conversations') convos(@CurrentUser() u: AuthUser) { return this.svc.conversations(u.id); }
+  @UseGuards(JwtGuard) @Get('conversations/by-partner/:partnerId')
+  byPartner(@CurrentUser() u: AuthUser, @Param('partnerId', ParseUUIDPipe) id: string) { return this.svc.byPartner(u.id, id); }
   @UseGuards(JwtGuard) @Get('pending') pending(@CurrentUser() u: AuthUser) { return this.svc.pendingQuestions(u.id); }
   @UseGuards(JwtGuard) @Get('expired') expired(@CurrentUser() u: AuthUser) { return this.svc.expiredQuestions(u.id); }
-  @UseGuards(JwtGuard) @Get('conversations/:id/messages') msgs(@CurrentUser() u: AuthUser, @Param('id') id: string) { return this.svc.messages(u.id, id); }
-  @UseGuards(JwtGuard) @Post('ask') ask(@CurrentUser() u: AuthUser, @Body() b: { partnerId: string; text: string }) { return this.svc.ask(u.id, b.partnerId, b.text); }
-  @UseGuards(JwtGuard) @Post('answer') answer(@CurrentUser() u: AuthUser, @Body() b: { conversationId: string; text: string }) { return this.svc.answer(u.id, b.conversationId, b.text); }
-  @UseGuards(JwtGuard) @Post('followup') follow(@CurrentUser() u: AuthUser, @Body() b: { fanId: string; text: string }) { return this.svc.followup(u.id, b.fanId, b.text); }
+  @UseGuards(JwtGuard) @Get('conversations/:id/messages') msgs(@CurrentUser() u: AuthUser, @Param('id', ParseUUIDPipe) id: string) { return this.svc.messages(u.id, id); }
+  @UseGuards(JwtGuard) @Post('ask') ask(@CurrentUser() u: AuthUser, @Body() b: AskQuestionDto) { return this.svc.ask(u.id, b.partnerId, b.text); }
+  @UseGuards(JwtGuard) @Post('answer') answer(@CurrentUser() u: AuthUser, @Body() b: AnswerDto) { return this.svc.answer(u.id, b.conversationId, b.text); }
+  @UseGuards(JwtGuard) @Post('followup') follow(@CurrentUser() u: AuthUser, @Body() b: FollowupDto) { return this.svc.followup(u.id, b.fanId, b.text); }
 }
 
 @Module({ controllers: [MessagingController], providers: [MessagingService] })

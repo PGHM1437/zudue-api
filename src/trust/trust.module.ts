@@ -30,6 +30,20 @@ class TrustService {
         insert into public.reports (reporter_id, target_type, target_id, reason, details)
         values (${userId}, ${b.targetType}, ${b.targetId}, ${b.reason}, ${b.details ?? null})
       `);
+      // No rpc_report_* exists for PROFILE/CALL/DM/MESSAGE (only shout-outs
+      // have one, via rpc_report_shoutout), and this table has no trigger —
+      // so filing a report previously reached the admin queue only if an
+      // admin happened to poll it. PLATFORM_ANNOUNCEMENT + the 4-column shape
+      // (recipient_id, event_type, title, message) is the exact pattern
+      // rpc_admin_set_user_role already uses for an admin-facing notice —
+      // matched here rather than adding related_entity_type/_id, whose enum
+      // values weren't verifiable live at the time this was written.
+      await tx.execute(sql`
+        insert into public.notifications (recipient_id, event_type, title, message)
+        select p.id, 'PLATFORM_ANNOUNCEMENT', 'New report filed',
+               ${'A ' + b.targetType.toLowerCase() + ' was reported: ' + b.reason}
+        from public.profiles p where p.role = 'ADMIN'
+      `);
       return { success: true };
     });
   }

@@ -30,7 +30,14 @@ export class OneSignalProvider {
         headers: { Authorization: `Basic ${this.restKey}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({
           app_id: this.appId,
-          include_player_ids: playerIds,
+          // include_player_ids is deprecated by OneSignal in favour of
+          // include_subscription_ids — same shape (an array of the ids this
+          // app already stores as onesignal_player_id), renamed on their end
+          // as OneSignal moved from "Player ID" to "Subscription ID"
+          // terminology. include_aliases is a different mechanism (targets
+          // external_id associations set via OneSignal.login on the client,
+          // which this app doesn't call) and isn't a drop-in replacement here.
+          include_subscription_ids: playerIds,
           data,
           priority: 10,
           content_available: true,          // background data delivery

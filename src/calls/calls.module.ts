@@ -1,4 +1,5 @@
-import { BadRequestException, Body, Controller, Get, Injectable, Module, Param, Post, Query, UseGuards } from '@nestjs/common';
+import { BadRequestException, Body, Controller, ForbiddenException, Get, Injectable, Module, Param, ParseUUIDPipe, Post, Query, UseGuards } from '@nestjs/common';
+import { BookCallDto, HeartbeatDto, MarkMissedDto, PreviewPriceDto } from './calls.dto';
 import { ConfigService } from '@nestjs/config';
 import { sql } from 'drizzle-orm';
 import { RtcTokenBuilder, RtcRole } from 'agora-token';
@@ -194,7 +195,10 @@ class CallsService {
         select 1 from public.calls where meeting_id = ${meetingId}
           and (fan_id = ${userId} or partner_id = ${userId}) limit 1
       `)) as unknown as any[];
-      if (!rows.length) throw new Error('NOT_A_PARTY');
+      // ForbiddenException, not a bare Error: a plain Error escapes Nest's
+      // exception filter and renders as an opaque 500, so a fan opening a call
+      // they aren't party to got "Internal server error" instead of a clear 403.
+      if (!rows.length) throw new ForbiddenException('NOT_A_PARTY');
       const appId = this.config.getOrThrow<string>('AGORA_APP_ID');
       const cert = this.config.getOrThrow<string>('AGORA_APP_CERTIFICATE');
       const uid = 0; // string-account tokens could use userId; 0 = let SDK assign
@@ -208,21 +212,24 @@ class CallsService {
 @Controller('calls')
 class CallsController {
   constructor(private readonly svc: CallsService) {}
-  @UseGuards(JwtGuard) @Get('preview') preview(@CurrentUser() u: AuthUser, @Query() q: any) {
+  @UseGuards(JwtGuard) @Get('preview') preview(@CurrentUser() u: AuthUser, @Query() q: PreviewPriceDto) {
     return this.svc.previewPrice(u.id, q.partnerId, q.duration, q.promo);
   }
-  @UseGuards(JwtGuard) @Post('book') book(@CurrentUser() u: AuthUser, @Body() b: any) { return this.svc.book(u.id, b); }
+  @UseGuards(JwtGuard) @Post('book') book(@CurrentUser() u: AuthUser, @Body() b: BookCallDto) { return this.svc.book(u.id, b); }
   @UseGuards(JwtGuard) @Get('bookings') bookings(@CurrentUser() u: AuthUser) { return this.svc.myBookings(u.id); }
   @UseGuards(JwtGuard) @Get('queue') queue(@CurrentUser() u: AuthUser) { return this.svc.partnerQueue(u.id); }
   @UseGuards(JwtGuard) @Get('history') history(@CurrentUser() u: AuthUser) { return this.svc.partnerHistory(u.id); }
   @UseGuards(JwtGuard) @Get('upcoming') upcoming(@CurrentUser() u: AuthUser) { return this.svc.partnerUpcoming(u.id); }
-  @UseGuards(JwtGuard) @Post(':bookingId/cancel') cancel(@CurrentUser() u: AuthUser, @Param('bookingId') id: string) { return this.svc.cancelBooking(u.id, id); }
-  @UseGuards(JwtGuard) @Post(':bookingId/ready') ready(@CurrentUser() u: AuthUser, @Param('bookingId') id: string) { return this.svc.signalReady(u.id, id); }
-  @UseGuards(JwtGuard) @Post(':bookingId/initiate') init(@CurrentUser() u: AuthUser, @Param('bookingId') id: string) { return this.svc.initiate(u.id, id); }
-  @UseGuards(JwtGuard) @Post(':bookingId/join') join(@CurrentUser() u: AuthUser, @Param('bookingId') id: string) { return this.svc.join(u.id, id); }
-  @UseGuards(JwtGuard) @Post('call/:callId/heartbeat') hb(@CurrentUser() u: AuthUser, @Param('callId') id: string, @Body('actor') actor: any) { return this.svc.heartbeat(u.id, id, actor); }
-  @UseGuards(JwtGuard) @Post('call/:callId/complete') done(@CurrentUser() u: AuthUser, @Param('callId') id: string) { return this.svc.complete(u.id, id); }
-  @UseGuards(JwtGuard) @Post('call/:callId/missed') miss(@CurrentUser() u: AuthUser, @Param('callId') id: string, @Body('status') s: string) { return this.svc.markMissed(u.id, id, s); }
+  // bookingId/callId are uuid columns — ParseUUIDPipe turns a malformed id into
+  // a clean 400 instead of a Postgres 22P02 surfacing as a bare 500.
+  // `:meetingId` is exempt: calls.meeting_id is text ('zudue-<uuid>'), not uuid.
+  @UseGuards(JwtGuard) @Post(':bookingId/cancel') cancel(@CurrentUser() u: AuthUser, @Param('bookingId', ParseUUIDPipe) id: string) { return this.svc.cancelBooking(u.id, id); }
+  @UseGuards(JwtGuard) @Post(':bookingId/ready') ready(@CurrentUser() u: AuthUser, @Param('bookingId', ParseUUIDPipe) id: string) { return this.svc.signalReady(u.id, id); }
+  @UseGuards(JwtGuard) @Post(':bookingId/initiate') init(@CurrentUser() u: AuthUser, @Param('bookingId', ParseUUIDPipe) id: string) { return this.svc.initiate(u.id, id); }
+  @UseGuards(JwtGuard) @Post(':bookingId/join') join(@CurrentUser() u: AuthUser, @Param('bookingId', ParseUUIDPipe) id: string) { return this.svc.join(u.id, id); }
+  @UseGuards(JwtGuard) @Post('call/:callId/heartbeat') hb(@CurrentUser() u: AuthUser, @Param('callId', ParseUUIDPipe) id: string, @Body() b: HeartbeatDto) { return this.svc.heartbeat(u.id, id, b.actor); }
+  @UseGuards(JwtGuard) @Post('call/:callId/complete') done(@CurrentUser() u: AuthUser, @Param('callId', ParseUUIDPipe) id: string) { return this.svc.complete(u.id, id); }
+  @UseGuards(JwtGuard) @Post('call/:callId/missed') miss(@CurrentUser() u: AuthUser, @Param('callId', ParseUUIDPipe) id: string, @Body() b: MarkMissedDto) { return this.svc.markMissed(u.id, id, b.status); }
   @UseGuards(JwtGuard) @Get('token/:meetingId') token(@CurrentUser() u: AuthUser, @Param('meetingId') m: string) { return this.svc.agoraToken(u.id, m); }
 }
 

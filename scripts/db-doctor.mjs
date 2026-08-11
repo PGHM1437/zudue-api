@@ -163,9 +163,16 @@ async function main() {
   }
 
   // ── MONEY_* ───────────────────────────────────────────────────────────
+  // No LIMIT here on purpose: this is a nightly/CI check, not a hot-path
+  // query, so there is no latency budget to protect. A `limit 20` used to cap
+  // the result — after a bug affecting 50 transactions, only 20 were ever
+  // reported and the other 30 stayed invisible until the next run. `brief()`
+  // below still truncates the printed summary to 8, so the console output
+  // stays readable; `rows.length` (used in its "+N more" suffix) now reflects
+  // the true total instead of being capped at the query itself.
   const unbalanced = await sql`
     select transaction_id from public.ledger_entries
-    group by transaction_id having sum(delta_paise) <> 0 limit 20`;
+    group by transaction_id having sum(delta_paise) <> 0`;
   if (unbalanced.length) fail('MONEY_LEDGER_UNBALANCED', 'transaction(s) whose ledger legs do not sum to zero', unbalanced);
 
   const walletDrift = await sql`
@@ -173,7 +180,7 @@ async function main() {
     from public.wallets w
     left join (select wallet_id, sum(delta_paise) s from public.ledger_entries
                where wallet_id is not null group by wallet_id) l on l.wallet_id = w.id
-    where w.balance_paise <> coalesce(l.s, 0) limit 20`;
+    where w.balance_paise <> coalesce(l.s, 0)`;
   if (walletDrift.length)
     fail('MONEY_WALLET_DRIFT', 'wallet cached balance disagrees with its ledger entries', walletDrift);
 

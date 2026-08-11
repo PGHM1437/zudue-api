@@ -3,6 +3,10 @@ import { sql } from 'drizzle-orm';
 import { DatabaseService } from '../db/database.service';
 import { JwtGuard } from '../auth/jwt.guard';
 import { AuthUser, CurrentUser } from '../auth/current-user.decorator';
+import {
+  CreateProfileDto, SubmitApplicationDto, SubmitKycDto,
+  UpdatePartnerProfileDto, UpdateProfileDto,
+} from './identity.dto';
 
 /**
  * THE single source of truth for "where is this user in their lifecycle".
@@ -63,23 +67,30 @@ class IdentityService {
     });
   }
 
-  /** Self-signup: creates the profile row (profiles_self_insert RLS, 0028) —
-   *  the provision_fan_wallet trigger auto-provisions the wallet. Without this,
-   *  a new auth user has no profile row and every other /me call 404s. */
-  createProfile(userId: string, b: { fullName: string; email?: string; mobileNumber?: string; role: 'FAN' | 'PARTNER' }) {
+  /**
+   * Self-signup: creates the profile row (profiles_self_insert RLS, 0028) —
+   * the provision_fan_wallet trigger auto-provisions the wallet. Without this,
+   * a new auth user has no profile row and every other /me call 404s.
+   *
+   * `role` is intentionally NOT accepted from the client and is always 'FAN'.
+   * It used to be — the body previously carried role: 'FAN' | 'PARTNER' as a
+   * bare TS type with no runtime validation, and inserted it verbatim. Since
+   * ValidationPipe only validates decorated DTO classes (this was a plain
+   * inline type), nothing ever checked the value: any string cast cleanly to
+   * user_role, including 'ADMIN'. Every real signup (register_screen.dart)
+   * only ever sent 'FAN' anyway — self-service PARTNER signup was removed in
+   * favour of the admin-reviewed application flow (0034/0053) and never
+   * updated here. Becoming PARTNER or ADMIN is exclusively an admin action
+   * (rpc_admin_set_user_role / the application review RPCs) from this point on.
+   * A DB-level trigger (0064) backs this up independently of this code.
+   */
+  createProfile(userId: string, b: { fullName: string; email?: string; mobileNumber?: string }) {
     return this.db.runAs(userId, async (tx) => {
       await tx.execute(sql`
         insert into public.profiles (id, role, full_name, email, mobile_number)
-        values (${userId}, ${b.role}::public.user_role, ${b.fullName}, ${b.email ?? null}, ${b.mobileNumber ?? null})
+        values (${userId}, 'FAN'::public.user_role, ${b.fullName}, ${b.email ?? null}, ${b.mobileNumber ?? null})
         on conflict (id) do nothing
       `);
-      if (b.role === 'PARTNER') {
-        await tx.execute(sql`
-          insert into public.partner_profiles (profile_id, display_name)
-          values (${userId}, ${b.fullName})
-          on conflict (profile_id) do nothing
-        `);
-      }
       return { created: true };
     });
   }
@@ -116,8 +127,11 @@ class IdentityService {
     return this.db.runAs(userId, async (tx) => {
       const allowed = ['display_name', 'bio', 'profile_image_path', 'vacation_mode', 'profile_complete'];
       const sets = Object.entries(patch).filter(([k]) => allowed.includes(k));
-      for (const [k, v] of sets) {
-        await tx.execute(sql`update public.partner_profiles set ${sql.identifier(k)} = ${v as any}, updated_at = now() where profile_id = ${userId}`);
+      // One UPDATE for every changed field, not one per field: editing
+      // display_name + bio + a photo used to be 3 sequential round-trips.
+      if (sets.length) {
+        const assignments = sets.map(([k, v]) => sql`${sql.identifier(k)} = ${v as any}`);
+        await tx.execute(sql`update public.partner_profiles set ${sql.join(assignments, sql`, `)}, updated_at = now() where profile_id = ${userId}`);
       }
 
       // Coming back from vacation is the moment the waitlist exists for: fans
@@ -183,18 +197,22 @@ class IdentityController {
   me(@CurrentUser() u: AuthUser) { return this.svc.me(u.id); }
 
   @UseGuards(JwtGuard) @Post()
-  create(@CurrentUser() u: AuthUser, @Body() b: { fullName: string; email?: string; mobileNumber?: string; role: 'FAN' | 'PARTNER' }) {
+  create(@CurrentUser() u: AuthUser, @Body() b: CreateProfileDto) {
     return this.svc.createProfile(u.id, b);
   }
 
   @UseGuards(JwtGuard) @Put()
-  update(@CurrentUser() u: AuthUser, @Body() body: Record<string, unknown>) { return this.svc.updateProfile(u.id, body); }
+  update(@CurrentUser() u: AuthUser, @Body() body: UpdateProfileDto) {
+    return this.svc.updateProfile(u.id, body as Record<string, unknown>);
+  }
 
   @UseGuards(JwtGuard) @Put('partner')
-  updatePartner(@CurrentUser() u: AuthUser, @Body() body: Record<string, unknown>) { return this.svc.updatePartnerProfile(u.id, body); }
+  updatePartner(@CurrentUser() u: AuthUser, @Body() body: UpdatePartnerProfileDto) {
+    return this.svc.updatePartnerProfile(u.id, body as Record<string, unknown>);
+  }
 
   @UseGuards(JwtGuard) @Post('kyc')
-  kyc(@CurrentUser() u: AuthUser, @Body('documents') documents: unknown[]) { return this.svc.submitKyc(u.id, documents ?? []); }
+  kyc(@CurrentUser() u: AuthUser, @Body() b: SubmitKycDto) { return this.svc.submitKyc(u.id, b.documents ?? []); }
 
   @UseGuards(JwtGuard) @Post('deletion')
   del(@CurrentUser() u: AuthUser, @Body('reason') reason?: string) { return this.svc.requestDeletion(u.id, reason); }
@@ -203,7 +221,7 @@ class IdentityController {
   cancelDel(@CurrentUser() u: AuthUser) { return this.svc.cancelDeletion(u.id); }
 
   @UseGuards(JwtGuard) @Post('partner/application')
-  apply(@CurrentUser() u: AuthUser, @Body() b: { applicantFullName: string; email: string; mobileNumber: string; primarySocialLink?: string; expertiseDescription?: string }) {
+  apply(@CurrentUser() u: AuthUser, @Body() b: SubmitApplicationDto) {
     return this.svc.submitApplication(u.id, b);
   }
 

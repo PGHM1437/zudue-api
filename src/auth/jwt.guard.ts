@@ -44,8 +44,33 @@ export class JwtGuard implements CanActivate {
       });
       req.user = this.toUser(payload);
       return true;
-    } catch {
-      throw new UnauthorizedException('Invalid token');
+    } catch (e) {
+      throw new UnauthorizedException(this.describe(e));
+    }
+  }
+
+  /**
+   * jose assigns a stable `.code` to every verification failure — checked
+   * here so the client gets back a reason it can act on (retry after
+   * refreshing an expired session vs. hard sign-out on a tampered/invalid
+   * token) instead of one indistinguishable "Invalid token" for every case,
+   * including a JWKS endpoint that's simply unreachable.
+   */
+  private describe(e: unknown): string {
+    const code = (e as { code?: string })?.code;
+    switch (code) {
+      case 'ERR_JWT_EXPIRED':
+        return 'Token expired';
+      case 'ERR_JWS_SIGNATURE_VERIFICATION_FAILED':
+        return 'Token signature invalid';
+      case 'ERR_JWT_CLAIM_VALIDATION_FAILED':
+        return 'Token claims invalid (wrong issuer/audience)';
+      case 'ERR_JWKS_TIMEOUT':
+      case 'ERR_JWKS_NO_MATCHING_KEY':
+      case 'ERR_JWKS_MULTIPLE_MATCHING_KEYS':
+        return 'Unable to verify token (key service unreachable)';
+      default:
+        return 'Invalid token';
     }
   }
 

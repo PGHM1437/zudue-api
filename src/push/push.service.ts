@@ -65,10 +65,12 @@ export class PushService {
 
     await this.db.runAsService(async (tx) => {
       const rows = (await tx.execute(sql`
-        select fcm_token, onesignal_player_id from public.push_tokens where profile_id = ${fanId}
-      `)) as unknown as Array<{ fcm_token: string | null; onesignal_player_id: string | null }>;
+        select fcm_token, onesignal_player_id, platform from public.push_tokens where profile_id = ${fanId}
+      `)) as unknown as Array<{ fcm_token: string | null; onesignal_player_id: string | null; platform: string | null }>;
 
-      const fcmTokens = rows.map((r) => r.fcm_token).filter((t): t is string => !!t);
+      const fcmTokens = rows
+        .filter((r): r is typeof r & { fcm_token: string } => !!r.fcm_token)
+        .map((r) => ({ token: r.fcm_token, platform: r.platform ?? undefined }));
       const playerIds = rows.map((r) => r.onesignal_player_id).filter((t): t is string => !!t);
 
       const [dead] = await Promise.all([
@@ -87,11 +89,14 @@ export class PushService {
     // Tell the device to stop ringing (fan answered elsewhere / partner cancelled).
     await this.db.runAsService(async (tx) => {
       const rows = (await tx.execute(sql`
-        select fcm_token, onesignal_player_id from public.push_tokens where profile_id = ${fanId}
-      `)) as unknown as Array<{ fcm_token: string | null; onesignal_player_id: string | null }>;
+        select fcm_token, onesignal_player_id, platform from public.push_tokens where profile_id = ${fanId}
+      `)) as unknown as Array<{ fcm_token: string | null; onesignal_player_id: string | null; platform: string | null }>;
       const data = { type: 'call_cancelled', callId };
+      const fcmTokens = rows
+        .filter((r): r is typeof r & { fcm_token: string } => !!r.fcm_token)
+        .map((r) => ({ token: r.fcm_token, platform: r.platform ?? undefined }));
       await Promise.all([
-        this.fcm.sendData(rows.map((r) => r.fcm_token).filter((t): t is string => !!t), data, 20),
+        this.fcm.sendData(fcmTokens, data, 20),
         this.onesignal.sendCall(rows.map((r) => r.onesignal_player_id).filter((t): t is string => !!t), data, 'Call ended', 'Missed call'),
       ]);
     });

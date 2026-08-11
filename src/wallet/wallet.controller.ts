@@ -5,6 +5,8 @@ import { Request } from 'express';
 import { JwtGuard } from '../auth/jwt.guard';
 import { CurrentUser, AuthUser } from '../auth/current-user.decorator';
 import { WalletService } from './wallet.service';
+import { CreateTopupDto, HistoryQueryDto } from './wallet.dto';
+import { RateLimit } from '../throttle/throttle.guard';
 
 @Controller('wallet')
 export class WalletController {
@@ -18,14 +20,15 @@ export class WalletController {
 
   @UseGuards(JwtGuard)
   @Get('history')
-  history(@CurrentUser() user: AuthUser, @Query('limit') limit?: string) {
-    return this.wallet.getHistory(user.id, limit ? Number(limit) : undefined);
+  history(@CurrentUser() user: AuthUser, @Query() q: HistoryQueryDto) {
+    return this.wallet.getHistory(user.id, q.limit);
   }
 
   @UseGuards(JwtGuard)
+  @RateLimit({ limit: 10, windowSeconds: 60 }) // money-adjacent — tighter than the global default
   @Post('topup')
-  topup(@CurrentUser() user: AuthUser, @Body('creditPaise') creditPaise: number) {
-    return this.wallet.createTopup(user.id, creditPaise);
+  topup(@CurrentUser() user: AuthUser, @Body() b: CreateTopupDto) {
+    return this.wallet.createTopup(user.id, b.creditPaise);
   }
 
   /** Razorpay webhook — NO auth guard; secured by HMAC signature instead. */

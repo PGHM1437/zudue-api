@@ -31,47 +31,85 @@ export class WalletService {
     private readonly payments: PaymentProvider,
   ) {}
 
-  /** Fan initiates a top-up: create the Razorpay order, record the pending order. */
+  /**
+   * Fan initiates a top-up: create the Razorpay order, record the pending order.
+   *
+   * Deliberately THREE phases, not one transaction:
+   *
+   *  1. read settings + cheap validation,
+   *  2. the Razorpay call, with NO transaction open,
+   *  3. one short transaction that takes the ceiling decision and records it.
+   *
+   * Phase 2 used to sit inside the transaction opened in phase 1. The pool is
+   * only 20 connections, so every slow gateway response pinned a connection
+   * AND an open transaction — enough concurrent top-ups against a degraded
+   * Razorpay would starve the pool for the whole API, not just for payments.
+   *
+   * Phase 3 holds a per-user advisory lock (not SELECT ... FOR UPDATE: wallets
+   * has only a SELECT policy, so FOR UPDATE cannot be granted under RLS) and
+   * counts already-reserved PENDING orders. Without both, two simultaneous
+   * top-ups each read the same pre-top-up balance, each saw room under the cap,
+   * and together they breached the prepaid ceiling.
+   *
+   * Reserved orders are only counted for 30 minutes. A crash between phases 2
+   * and 3, or an order the fan simply abandons, must not hold a reservation
+   * against them forever — unpaid Razorpay orders expire on their side too.
+   */
   async createTopup(userId: string, creditPaise: number) {
     if (!Number.isInteger(creditPaise) || creditPaise <= 0) {
       throw new BadRequestException('creditPaise must be a positive integer');
     }
-    return this.db.runAs(userId, async (tx) => {
-      const [settings] = (await tx.execute(sql`
+
+    // ── Phase 1 · settings + per-transaction limits ────────────────────────
+    const settings = await this.db.runAs(userId, async (tx) => {
+      const [row] = (await tx.execute(sql`
         select gst_rate, min_wallet_topup_paise, max_wallet_topup_paise, max_wallet_balance_paise
         from public.platform_settings where id = 1
       `)) as unknown as Array<{
         gst_rate: string; min_wallet_topup_paise: number;
         max_wallet_topup_paise: number; max_wallet_balance_paise: number | null;
       }>;
+      return row;
+    });
 
-      const gstRate = Number(settings?.gst_rate ?? 0.18);
-      const gstPaise = Math.round(creditPaise * gstRate);
-      const amountPaise = creditPaise + gstPaise;
+    const gstRate = Number(settings?.gst_rate ?? 0.18);
+    const gstPaise = Math.round(creditPaise * gstRate);
+    const amountPaise = creditPaise + gstPaise;
 
-      if (settings?.min_wallet_topup_paise && creditPaise < settings.min_wallet_topup_paise) {
-        throw new BadRequestException('BELOW_MIN_TOPUP');
-      }
-      if (settings?.max_wallet_topup_paise && creditPaise > settings.max_wallet_topup_paise) {
-        throw new BadRequestException('ABOVE_MAX_TOPUP');
-      }
+    if (settings?.min_wallet_topup_paise && creditPaise < settings.min_wallet_topup_paise) {
+      throw new BadRequestException('BELOW_MIN_TOPUP');
+    }
+    if (settings?.max_wallet_topup_paise && creditPaise > settings.max_wallet_topup_paise) {
+      throw new BadRequestException('ABOVE_MAX_TOPUP');
+    }
 
-      // Prepaid balance ceiling. Checked HERE, at order creation, rather than
-      // at capture: rejecting after Razorpay has taken the money would mean an
-      // immediate refund and a fan who paid for nothing.
+    // ── Phase 2 · external call, no transaction, no connection held ────────
+    const order = await this.payments.createOrder(amountPaise, `topup_${userId.slice(0, 8)}_${Date.now()}`, {
+      profile_id: userId,
+    });
+
+    // ── Phase 3 · authoritative ceiling check + record, serialised per user ─
+    return this.db.runAs(userId, async (tx) => {
       if (settings?.max_wallet_balance_paise) {
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtext('zudue:topup'), hashtext(${userId}))`);
+
         const [w] = (await tx.execute(sql`
           select balance_paise from public.wallets where profile_id = ${userId}
         `)) as unknown as Array<{ balance_paise: number }>;
-        const projected = Number(w?.balance_paise ?? 0) + creditPaise;
+        const [r] = (await tx.execute(sql`
+          select coalesce(sum(credit_paise), 0) as reserved from public.topup_orders
+          where profile_id = ${userId} and status = 'PENDING'
+            and created_at > now() - interval '30 minutes'
+        `)) as unknown as Array<{ reserved: number }>;
+
+        const projected = Number(w?.balance_paise ?? 0) + Number(r?.reserved ?? 0) + creditPaise;
         if (projected > settings.max_wallet_balance_paise) {
+          // The order created in phase 2 is simply never paid and expires at
+          // Razorpay. No money has moved, so there is nothing to refund —
+          // which is the whole reason the ceiling is enforced before capture.
           throw new BadRequestException('WALLET_BALANCE_CAP_EXCEEDED');
         }
       }
-
-      const order = await this.payments.createOrder(amountPaise, `topup_${userId.slice(0, 8)}_${Date.now()}`, {
-        profile_id: userId,
-      });
 
       // Fan self-inserts their own pending order (RLS: topup_self_insert).
       await tx.execute(sql`
@@ -100,7 +138,15 @@ export class WalletService {
     if (!this.payments.verifyWebhookSignature(rawBody, signature)) {
       throw new BadRequestException('INVALID_SIGNATURE');
     }
-    const event = JSON.parse(rawBody.toString('utf8'));
+    // A payload that passes HMAC verification is still just bytes — a
+    // malformed body threw an uncaught SyntaxError here, which Nest renders
+    // as a 500. Razorpay retries on 5xx, so a single bad delivery could loop.
+    let event: any;
+    try {
+      event = JSON.parse(rawBody.toString('utf8'));
+    } catch {
+      throw new BadRequestException('MALFORMED_PAYLOAD');
+    }
     const eventId: string = event.id ?? event.payload?.payment?.entity?.id;
 
     return this.db.runAsService(async (tx) => {
