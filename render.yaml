@@ -4,13 +4,8 @@ services:
     runtime: node
     region: singapore
     plan: starter
-    # Project is a pnpm workspace (packageManager: "pnpm@9.0.0", pnpm-lock.yaml
-    # at repo root) — npm install here ignored the lockfile and could resolve
-    # a different dependency tree than the one CI tests against. Corepack ships
-    # with Node 16.9+/Render's node runtime, so `corepack enable` gets the
-    # pinned pnpm version without a separate install step.
-    buildCommand: corepack enable && pnpm install --frozen-lockfile && pnpm build
-    startCommand: pnpm start
+    buildCommand: npm install && npm run build
+    startCommand: npm start
     envVars:
       - key: NODE_ENV
         value: production
@@ -47,7 +42,7 @@ services:
       # browser will block every call. Add the actual origin (e.g. the Vercel
       # preview domain) or requests fail before reaching a route.
       - key: CORS_ORIGINS
-        value: https://zudue.com,https://www.zudue.com,https://admin.zudue.com,https://zudue-app.vercel.app,https://zudue-2-0.vercel.app
+        value: https://zudue.com,https://www.zudue.com
 
       # ── Redis ─────────────────────────────────────────────────────────
       # Was absent entirely. JobsModule reads it with getOrThrow at boot, and
