@@ -85,6 +85,34 @@ export class PushService {
     });
   }
 
+  /**
+   * "You're next in line" alert — a visible push, not the CallKit ring
+   * (sendIncomingCall). Fired once, when the partner initiates the call ahead
+   * of this fan in their queue.
+   */
+  async notifyQueueNext(fanId: string, title: string, body: string, data: Record<string, string>) {
+    await this.db.runAsService(async (tx) => {
+      const rows = (await tx.execute(sql`
+        select fcm_token, onesignal_player_id, platform from public.push_tokens where profile_id = ${fanId}
+      `)) as unknown as Array<{ fcm_token: string | null; onesignal_player_id: string | null; platform: string | null }>;
+
+      const fcmTokens = rows
+        .filter((r): r is typeof r & { fcm_token: string } => !!r.fcm_token)
+        .map((r) => ({ token: r.fcm_token, platform: r.platform ?? undefined }));
+      const playerIds = rows.map((r) => r.onesignal_player_id).filter((t): t is string => !!t);
+
+      const [dead] = await Promise.all([
+        this.fcm.sendNotification(fcmTokens, { title, body }, data),
+        this.onesignal.sendNotification(playerIds, title, body, data),
+      ]);
+
+      if (dead.length) {
+        await tx.execute(sql`delete from public.push_tokens where profile_id = ${fanId} and fcm_token = any(${dead})`);
+        this.log.log(`pruned ${dead.length} dead FCM tokens for ${fanId}`);
+      }
+    });
+  }
+
   async cancelCall(fanId: string, callId: string) {
     // Tell the device to stop ringing (fan answered elsewhere / partner cancelled).
     await this.db.runAsService(async (tx) => {

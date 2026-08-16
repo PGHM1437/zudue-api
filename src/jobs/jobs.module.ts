@@ -36,6 +36,7 @@ export class JobsService implements OnModuleInit, OnModuleDestroy {
       'stalled-calls': { pattern: '* * * * *' },
       'expire-windows': { pattern: '*/15 * * * *' },
       'purge-deletions': { pattern: '0 3 * * *' },
+      'cleanup-topups': { pattern: '30 2 * * *' },
     };
   }
 
@@ -56,6 +57,11 @@ export class JobsService implements OnModuleInit, OnModuleDestroy {
     await every('stalled-calls', '* * * * *');
     await every('expire-windows', '*/15 * * * *');
     await every('purge-deletions', '0 3 * * *');
+    // Abandoned Razorpay checkouts (migration 0070) — daily, off-peak. Marks
+    // PENDING topup_orders older than 24h as FAILED so they stop inflating
+    // pending-balance reporting. UPDATE only, never DELETE: the row and its
+    // razorpay_order_id stay for audit.
+    await every('cleanup-topups', '30 2 * * *');
     // Payouts are on-demand and processed offline (admin transfers by hand,
     // then records the UTR) — no scheduled batching. Clean up old repeatable
     // job from Redis if it exists (harmless if already gone).
@@ -76,6 +82,7 @@ export class JobsService implements OnModuleInit, OnModuleDestroy {
       case 'stalled-calls': return this.stalledCalls();
       case 'expire-windows': return this.expireWindows();
       case 'purge-deletions': return this.purgeDeletions();
+      case 'cleanup-topups': return this.cleanupTopups();
       default: return Promise.resolve();
     }
   }
@@ -94,7 +101,22 @@ export class JobsService implements OnModuleInit, OnModuleDestroy {
         ok++;
       } catch (e) {
         failed++;
-        this.log.error(`${label} failed for ${id}: ${(e as Error).message}`);
+        const msg = (e as Error).message;
+        this.log.error(`${label} failed for ${id}: ${msg}`);
+
+        // H4: Persist settlement failures to audit_log so they survive
+        // beyond the ephemeral Render console. Legacy's trigger was just
+        // RAISE LOG (equally ephemeral) — neither system ever had this.
+        try {
+          await this.db.runAsService((tx) => tx.execute(sql`
+            insert into public.audit_log (actor_id, actor_role, action, target_type, target_id, new_value)
+            values (null, 'SYSTEM', 'SETTLE_FAILURE', ${label}, ${id},
+                    ${JSON.stringify({ error: msg })}::jsonb)
+          `));
+        } catch (auditErr) {
+          // If the audit insert itself fails, don't mask the original error
+          this.log.error(`audit_log insert failed for ${label}/${id}: ${(auditErr as Error).message}`);
+        }
       }
     }
     return { ok, failed };
@@ -116,17 +138,37 @@ export class JobsService implements OnModuleInit, OnModuleDestroy {
       this.log.error(`expire-bookings had ${expiry.failed} failures`);
     }
 
+    // EXPIRED_FAN_NO_JOIN removed from this filter (0066): that status is
+    // refund-only, resolved a few lines up inside
+    // process_end_of_day_expired_bookings. It used to also match here and
+    // get passed to rpc_settle_booking, which had no internal status check
+    // — paying the partner in full on top of the fan's full refund, from
+    // escrow that only ever received one payment. rpc_settle_booking is now
+    // hardened to refuse non-COMPLETED_SUCCESSFUL bookings regardless of
+    // what this query sends it; narrowing the query too just avoids wasted
+    // attempts and false "settle had failures" log noise on every run.
+    // Reported items are also excluded here for the same reason — the DB
+    // layer already refuses them (REPORT_PENDING), this just keeps the
+    // sweep's own success/failure counts honest.
     const bookings = await this.ids(sql`
-      select id from public.bookings
-      where status in ('COMPLETED_SUCCESSFUL','EXPIRED_FAN_NO_JOIN') and settle_at <= now()
-        and not exists (select 1 from public.partner_earnings e where e.service_id = bookings.id)
+      select id from public.bookings b
+      where b.status = 'COMPLETED_SUCCESSFUL' and b.settle_at <= now()
+        and not exists (select 1 from public.partner_earnings e where e.service_id = b.id)
+        and not exists (
+          select 1 from public.reports r join public.calls c on c.id = r.target_id
+           where r.target_type = 'CALL' and c.booking_id = b.id and r.status in ('PENDING','REVIEWING')
+        )
       limit 200`);
     const b = await this.forEachId(bookings, 'settle-booking', 'rpc_settle_booking');
 
     const windows = await this.ids(sql`
-      select id from public.conversation_windows
-      where kind='PAID' and status='ANSWERED' and settle_at <= now()
-        and not exists (select 1 from public.partner_earnings e where e.service_id = conversation_windows.id)
+      select id from public.conversation_windows w
+      where w.kind='PAID' and w.status='ANSWERED' and w.settle_at <= now()
+        and not exists (select 1 from public.partner_earnings e where e.service_id = w.id)
+        and not exists (
+          select 1 from public.reports r
+           where r.target_type = 'DM' and r.target_id = w.id and r.status in ('PENDING','REVIEWING')
+        )
       limit 200`);
     const w = await this.forEachId(windows, 'settle-window', 'rpc_settle_window');
 
@@ -139,8 +181,18 @@ export class JobsService implements OnModuleInit, OnModuleDestroy {
       limit 200`);
     await this.forEachId(dueConfirms, 'auto-confirm-shoutout', 'rpc_auto_confirm_shoutout');
 
+    // FIX 7 (migration 0066): Expire undelivered shoutouts past their deadline.
+    // If partner never uploads video by settle_at, fan gets full refund.
+    const overdueShoutouts = await this.ids(sql`
+      select id from public.shout_out_requests
+      where status='AWAITING_PARTNER_VIDEO' and settle_at <= now()
+      limit 200`);
+    const e = await this.forEachId(overdueShoutouts, 'expire-shoutout', 'rpc_expire_shoutout');
+
     // Fixed: shout-outs now actually settle (rpc_settle_shoutout, migration 0036).
     // fan_confirmed_at gate (0061): unconfirmed deliveries never settle by timer.
+    // FIX 6 (migration 0066): Both manual and auto-confirm now trigger immediate
+    // settlement (settle_at=now()), so this sweep picks them up within 15 minutes.
     const shoutouts = await this.ids(sql`
       select id from public.shout_out_requests
       where status='VIDEO_DELIVERED_TO_FAN' and settle_at <= now()
@@ -149,8 +201,8 @@ export class JobsService implements OnModuleInit, OnModuleDestroy {
       limit 200`);
     const s = await this.forEachId(shoutouts, 'settle-shoutout', 'rpc_settle_shoutout');
 
-    this.log.log(`settle — bookings ${b.ok}/${b.ok + b.failed}, windows ${w.ok}/${w.ok + w.failed}, shoutouts ${s.ok}/${s.ok + s.failed}`);
-    if (b.failed || w.failed || s.failed) this.log.error(`settle had failures: bookings=${b.failed} windows=${w.failed} shoutouts=${s.failed}`);
+    this.log.log(`settle — bookings ${b.ok}/${b.ok + b.failed}, windows ${w.ok}/${w.ok + w.failed}, expired ${e.ok}/${e.ok + e.failed}, shoutouts ${s.ok}/${s.ok + s.failed}`);
+    if (b.failed || w.failed || e.failed || s.failed) this.log.error(`settle had failures: bookings=${b.failed} windows=${w.failed} expired=${e.failed} shoutouts=${s.failed}`);
   }
 
   /** IN_PROGRESS past deadline → auto-complete; stale heartbeat → drop; PARTNER_INITIATED sweeper → DB function. */
@@ -254,6 +306,18 @@ export class JobsService implements OnModuleInit, OnModuleDestroy {
       }
     }
     if (ok || failed) this.log.log(`purge — anonymised ${ok}/${ok + failed} accounts`);
+  }
+
+  /**
+   * Abandoned Razorpay checkouts → FAILED (migration 0070).
+   * The RPC does the whole batch in one statement and returns how many rows
+   * it touched, so there's no per-item loop here — unlike settle(), a single
+   * status flip has no per-row failure mode worth isolating.
+   */
+  private async cleanupTopups() {
+    const res = await this.db.runAsService((tx) => this.db.rpc(tx, 'rpc_cleanup_abandoned_topups', []));
+    const n = res && typeof res === 'object' && 'marked_failed' in res ? (res.marked_failed as number) : 0;
+    if (n > 0) this.log.log(`cleanup-topups — marked ${n} abandoned top-up(s) FAILED`);
   }
 
   async onModuleDestroy() {

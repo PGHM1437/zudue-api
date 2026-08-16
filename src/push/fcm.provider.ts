@@ -87,4 +87,43 @@ export class FcmProvider {
     }));
     return dead;
   }
+
+  /**
+   * Visible push (a `notification` block, not data-only) for anything that
+   * should show up in the OS tray on its own — the mobile client has no
+   * handler for arbitrary data-only message types (only 'incoming_call' and
+   * 'call_cancelled' are recognised; see push_service.dart), so a data-only
+   * send here would silently show nothing. Normal priority: unlike a call
+   * ring, this isn't racing Doze for a full-screen intent.
+   */
+  async sendNotification(
+    tokens: Array<{ token: string; platform?: string }>,
+    notification: { title: string; body: string },
+    data?: Record<string, string>,
+  ): Promise<string[]> {
+    if (!this.enabled || tokens.length === 0) return [];
+    const access = await this.jwt!.getAccessToken();
+    const bearer = access.token;
+    const dead: string[] = [];
+
+    await Promise.all(tokens.map(async ({ token }) => {
+      try {
+        const res = await fetch(`https://fcm.googleapis.com/v1/projects/${this.projectId}/messages:send`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${bearer}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            message: { token, notification, ...(data ? { data } : {}) },
+          }),
+        });
+        if (!res.ok) {
+          const body = await res.text();
+          if (res.status === 404 || body.includes('UNREGISTERED') || body.includes('INVALID_ARGUMENT')) dead.push(token);
+          else this.log.warn(`FCM ${res.status}: ${body.slice(0, 200)}`);
+        }
+      } catch (e) {
+        this.log.warn(`FCM send failed: ${(e as Error).message}`);
+      }
+    }));
+    return dead;
+  }
 }

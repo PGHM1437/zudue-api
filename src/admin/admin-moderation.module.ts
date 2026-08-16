@@ -72,9 +72,77 @@ class AdminModerationService {
    * Logic moved to DB function rpc_admin_force_settle_booking (migration 0063).
    */
   forceSettleBooking(userId: string, bookingId: string) {
-    return this.db.runAs(userId, (tx) => 
+    return this.db.runAs(userId, (tx) =>
       this.db.rpc(tx, 'rpc_admin_force_settle_booking', [userId, bookingId])
     );
+  }
+
+  /**
+   * Same escape hatch as forceSettleBooking, for the other two service types
+   * (migration 0069). The settlement sweep has demonstrably missed items —
+   * one booking needed manual rescue on 2026-08-09 — and until now only
+   * bookings had a remedy. Both RPCs delegate to the same idempotent
+   * rpc_settle_* the sweep uses, so a replay returns already_settled rather
+   * than double-paying, and both respect the report-hold gate added in 0066.
+   * FINANCE/SUPER_ADMIN only (enforced inside the RPC).
+   */
+  forceSettleWindow(userId: string, windowId: string) {
+    return this.db.runAs(userId, (tx) =>
+      this.db.rpc(tx, 'rpc_admin_force_settle_window', [userId, windowId])
+    );
+  }
+
+  forceSettleShoutout(userId: string, shoutoutId: string) {
+    return this.db.runAs(userId, (tx) =>
+      this.db.rpc(tx, 'rpc_admin_force_settle_shoutout', [userId, shoutoutId])
+    );
+  }
+
+  /**
+   * Admin escape hatch: manually recover a stuck booking/call that the
+   * automated sweeps didn't catch. Marks any active call as DROPPED_TECHNICAL_ISSUE
+   * and the booking as EXPIRED_TECHNICAL_ISSUE. Logged to audit_log.
+   * (M8 — two independent audit passes confirmed this gap.)
+   */
+  recoverCall(userId: string, bookingId: string, reason?: string) {
+    return this.db.runAs(userId, (tx) =>
+      this.db.rpc(tx, 'rpc_admin_recover_call', [userId, bookingId, reason ?? 'Admin manual recovery'])
+    );
+  }
+
+  /**
+   * Resolve a booking parked in REQUIRES_ADMIN_REVIEW (migration 0066a) —
+   * a call that ran past the 3-minute minimum but short of the booked
+   * duration, so neither a clean settle nor a clean refund applies.
+   *
+   * The admin supplies the split. The RPC rejects it unless
+   * partnerPaise + fanRefundPaise equals the booking's original price
+   * exactly, so escrow always lands at zero for that booking — no partial
+   * amount can be stranded. FINANCE/SUPER_ADMIN only.
+   */
+  resolvePartialCall(userId: string, bookingId: string, partnerPaise: number, fanRefundPaise: number, notes?: string) {
+    return this.db.runAs(userId, (tx) =>
+      this.db.rpc(tx, 'rpc_admin_resolve_partial_call', [userId, bookingId, partnerPaise, fanRefundPaise, notes ?? null])
+    );
+  }
+
+  /** Bookings parked in REQUIRES_ADMIN_REVIEW awaiting a manual split. */
+  partialCallQueue(userId: string) {
+    return this.db.runAs(userId, async (tx) =>
+      (await tx.execute(sql`
+        select b.id, b.fan_id, fp.full_name as fan_name,
+               b.partner_id, pp.display_name as partner_name,
+               b.scheduled_date, b.selected_duration,
+               b.price_paise, b.original_price_paise,
+               (select max(extract(epoch from (c.ended_at - c.started_at)))::int
+                  from public.calls c where c.booking_id = b.id) as actual_duration_sec,
+               b.updated_at
+        from public.bookings b
+        join public.profiles fp on fp.id = b.fan_id
+        left join public.partner_profiles pp on pp.profile_id = b.partner_id
+        where b.status = 'REQUIRES_ADMIN_REVIEW'
+        order by b.updated_at asc limit 200
+      `)) as unknown as any[]);
   }
 
   // ── Content oversight ──
@@ -125,6 +193,33 @@ class AdminModerationController {
   @UseGuards(JwtGuard, AdminGuard) @Post('bookings/:id/force-settle')
   forceSettleBooking(@CurrentUser() u: AuthUser, @Param('id') id: string) {
     return this.svc.forceSettleBooking(u.id, id);
+  }
+
+  @UseGuards(JwtGuard, AdminGuard) @Post('windows/:id/force-settle')
+  forceSettleWindow(@CurrentUser() u: AuthUser, @Param('id') id: string) {
+    return this.svc.forceSettleWindow(u.id, id);
+  }
+
+  @UseGuards(JwtGuard, AdminGuard) @Post('shoutouts/:id/force-settle')
+  forceSettleShoutout(@CurrentUser() u: AuthUser, @Param('id') id: string) {
+    return this.svc.forceSettleShoutout(u.id, id);
+  }
+
+  @UseGuards(JwtGuard, AdminGuard) @Post('bookings/:id/recover-call')
+  recoverCall(@CurrentUser() u: AuthUser, @Param('id') id: string, @Body('reason') reason?: string) {
+    return this.svc.recoverCall(u.id, id, reason);
+  }
+
+  @UseGuards(JwtGuard, AdminGuard) @Get('bookings/partial-review')
+  partialCallQueue(@CurrentUser() u: AuthUser) { return this.svc.partialCallQueue(u.id); }
+
+  @UseGuards(JwtGuard, AdminGuard) @Post('bookings/:id/resolve-partial')
+  resolvePartialCall(
+    @CurrentUser() u: AuthUser,
+    @Param('id') id: string,
+    @Body() b: { partnerPaise: number; fanRefundPaise: number; notes?: string },
+  ) {
+    return this.svc.resolvePartialCall(u.id, id, b.partnerPaise, b.fanRefundPaise, b.notes);
   }
 
   @UseGuards(JwtGuard, AdminGuard) @Get('video-calls') videoCalls(@CurrentUser() u: AuthUser) { return this.svc.videoCalls(u.id); }

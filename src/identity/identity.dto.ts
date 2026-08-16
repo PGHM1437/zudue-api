@@ -31,11 +31,11 @@ export class UpdateProfileDto {
   @IsOptional() @IsString() @MaxLength(120) full_name?: string;
   @IsOptional() @IsString() @MaxLength(20) mobile_number?: string;
 
-  /** Sanity bound only — deliberately NOT a minimum-age policy. If the platform
-   *  ever needs one, it belongs somewhere enforceable (signup + the DB), not
-   *  hidden in an optional demographics patch that callers already treat as
-   *  non-fatal. */
-  @IsOptional() @Type(() => Number) @IsInt() @Min(1) @Max(120) age?: number;
+  /** Matches the DB floor added in migration 0074 (profiles_age_range CHECK,
+   *  13-120, COPPA-aligned). Keep these in lock-step: a lower value here than
+   *  the DB allows just means users get a raw constraint-violation 500
+   *  instead of a clean 400 for ages 1-12. */
+  @IsOptional() @Type(() => Number) @IsInt() @Min(13) @Max(120) age?: number;
 
   /** Cast to ::gender_enum at the bind site — an unknown value raised 22P02. */
   @IsOptional() @IsIn(GENDERS as unknown as string[]) gender?: string;
@@ -49,6 +49,7 @@ export class UpdatePartnerProfileDto {
   @IsOptional() @IsString() @MaxLength(512) profile_image_path?: string;
   @IsOptional() @IsBoolean() vacation_mode?: boolean;
   @IsOptional() @IsBoolean() profile_complete?: boolean;
+  @IsOptional() @IsArray() @IsString({ each: true }) languages?: string[];
 }
 
 export class SubmitKycDto {

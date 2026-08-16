@@ -30,20 +30,30 @@ class TrustService {
         insert into public.reports (reporter_id, target_type, target_id, reason, details)
         values (${userId}, ${b.targetType}, ${b.targetId}, ${b.reason}, ${b.details ?? null})
       `);
-      // No rpc_report_* exists for PROFILE/CALL/DM/MESSAGE (only shout-outs
-      // have one, via rpc_report_shoutout), and this table has no trigger —
-      // so filing a report previously reached the admin queue only if an
-      // admin happened to poll it. PLATFORM_ANNOUNCEMENT + the 4-column shape
-      // (recipient_id, event_type, title, message) is the exact pattern
-      // rpc_admin_set_user_role already uses for an admin-facing notice —
-      // matched here rather than adding related_entity_type/_id, whose enum
-      // values weren't verifiable live at the time this was written.
-      await tx.execute(sql`
-        insert into public.notifications (recipient_id, event_type, title, message)
-        select p.id, 'PLATFORM_ANNOUNCEMENT', 'New report filed',
-               ${'A ' + b.targetType.toLowerCase() + ' was reported: ' + b.reason}
-        from public.profiles p where p.role = 'ADMIN'
-      `);
+      // C6 fix (0079): this used to be a direct INSERT into notifications, which
+      // violates RLS (a non-admin reporter can't insert a row for recipient_id !=
+      // their own session) — and because that insert had no .catch(), the RLS
+      // error rolled back the WHOLE transaction, meaning the report above never
+      // saved either. rpc_create_notification is SECURITY DEFINER so it bypasses
+      // that, looped once per admin (same fan-out as the original SELECT ...
+      // WHERE role='ADMIN'). related_entity is deliberately NULL, matching the
+      // original 4-column shape — with a value there, the dedup ON CONFLICT would
+      // collapse distinct reports against the same target into one notification.
+      const admins = (await tx.execute(sql`select id from public.profiles where role = 'ADMIN'`)) as unknown as Array<{ id: string }>;
+      for (const admin of admins) {
+        await this.db
+          .rpc(tx, 'rpc_create_notification', [
+            admin.id,
+            userId,
+            sql`'PLATFORM_ANNOUNCEMENT'::public.notification_event_type_enum` as any,
+            'New report filed',
+            `A ${b.targetType.toLowerCase()} was reported: ${b.reason}`,
+            null,
+            null,
+            sql`${JSON.stringify({ targetType: b.targetType, targetId: b.targetId })}::jsonb` as any,
+          ])
+          .catch(() => undefined);
+      }
       return { success: true };
     });
   }

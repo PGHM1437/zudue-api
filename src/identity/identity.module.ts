@@ -51,7 +51,7 @@ class IdentityService {
         select p.id, p.role, p.full_name, p.email, p.mobile_number, p.age, p.gender,
                p.verification_status, p.account_status, p.referral_code, p.notification_prefs,
                pp.display_name, pp.bio, pp.status as partner_status, pp.is_active,
-               pp.vacation_mode, pp.is_premium, pp.is_featured, pp.profile_complete, pp.handle,
+               pp.vacation_mode, pp.is_premium, pp.is_featured, pp.profile_complete, pp.handle, pp.languages,
                ${LIFECYCLE_SQL} as partner_lifecycle,
                -- Pending deletion is exposed here so the client can offer the
                -- cancel path during the grace period. Without it the app told
@@ -127,10 +127,17 @@ class IdentityService {
     return this.db.runAs(userId, async (tx) => {
       const allowed = ['display_name', 'bio', 'profile_image_path', 'vacation_mode', 'profile_complete'];
       const sets = Object.entries(patch).filter(([k]) => allowed.includes(k));
+      const assignments = sets.map(([k, v]) => sql`${sql.identifier(k)} = ${v as any}`);
+      // languages is text[], not plain text — cast explicitly at the bind
+      // site, same reason gender/notification_prefs are cast in updateProfile
+      // above: an untyped array bind fails column-type resolution.
+      if (Array.isArray(patch.languages)) {
+        const langs = patch.languages.filter((l): l is string => typeof l === 'string');
+        assignments.push(sql`languages = ${langs}::text[]`);
+      }
       // One UPDATE for every changed field, not one per field: editing
       // display_name + bio + a photo used to be 3 sequential round-trips.
-      if (sets.length) {
-        const assignments = sets.map(([k, v]) => sql`${sql.identifier(k)} = ${v as any}`);
+      if (assignments.length) {
         await tx.execute(sql`update public.partner_profiles set ${sql.join(assignments, sql`, `)}, updated_at = now() where profile_id = ${userId}`);
       }
 
@@ -144,7 +151,7 @@ class IdentityService {
         const res = await this.db.rpc(tx, 'rpc_notify_waitlist', [userId]);
         notified = Number(res?.notified ?? 0);
       }
-      return { updated: sets.length > 0, waitlistNotified: notified };
+      return { updated: assignments.length > 0, waitlistNotified: notified };
     });
   }
 

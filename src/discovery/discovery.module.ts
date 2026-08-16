@@ -72,7 +72,7 @@ class DiscoveryService {
     return this.db.runAnon(async (tx) => {
       const [profile] = (await tx.execute(sql`
         select pp.profile_id, pp.display_name, pp.bio, pp.profile_image_path,
-               pp.is_premium, pp.is_featured, pp.status, pp.is_active, pp.vacation_mode
+               pp.is_premium, pp.is_featured, pp.status, pp.is_active, pp.vacation_mode, pp.languages
         from public.partner_profiles pp where pp.profile_id = ${partnerId}
       `)) as unknown as any[];
       if (profile) profile.profile_image_path = toPublicMediaUrl(profile.profile_image_path, this.config.get<string>('R2_PUBLIC_MEDIA_URL'));
@@ -84,7 +84,45 @@ class DiscoveryService {
         select platform, url from public.partner_social_links
         where partner_id = ${partnerId} and is_approved = true
       `)) as unknown as any[];
-      return profile ? { ...profile, services, socialLinks: links } : null;
+      // Trust bar (REDESIGN_TODO.md #1 — was a client-side mock). Three
+      // independent aggregates, each NULL/0 on an empty set rather than
+      // erroring, so a brand-new partner just shows "0"/"—" honestly:
+      //  - moments_count: completed calls + delivered shout-outs + answered
+      //    questions — every kind of "delivered" service this partner has.
+      //  - median_reply_minutes: median time from a question's opened_at to
+      //    the partner's own first reply in that window (percentile_cont over
+      //    zero rows is NULL, not an error).
+      //  - fulfillment_rate_pct: COMPLETED_SUCCESSFUL bookings as a % of all
+      //    of this partner's bookings ever (any status) — replaces the
+      //    original mock's "% fans return" per product decision, since a
+      //    booking-completion rate is what's actually computable today.
+      const [trust] = (await tx.execute(sql`
+        select
+          (
+            (select count(*) from public.calls where partner_id = ${partnerId} and attempt_status = 'COMPLETED_SUCCESSFUL')
+            + (select count(*) from public.shout_out_requests where partner_id = ${partnerId} and status = 'VIDEO_DELIVERED_TO_FAN')
+            + (select count(*) from public.conversation_windows w join public.conversations c on c.id = w.conversation_id
+                where c.partner_id = ${partnerId} and w.status = 'ANSWERED')
+          ) as moments_count,
+          (
+            select percentile_cont(0.5) within group (order by extract(epoch from (r.created_at - w.opened_at)) / 60)
+            from public.conversation_windows w
+            join public.conversations c on c.id = w.conversation_id
+            join lateral (
+              select m.created_at from public.messages m
+              where m.window_id = w.id and m.sender = 'PARTNER'
+              order by m.created_at asc limit 1
+            ) r on true
+            where c.partner_id = ${partnerId} and w.status = 'ANSWERED'
+          ) as median_reply_minutes,
+          (
+            select case when count(*) = 0 then null
+              else round(100.0 * count(*) filter (where status = 'COMPLETED_SUCCESSFUL') / count(*))
+            end
+            from public.bookings where partner_id = ${partnerId}
+          ) as fulfillment_rate_pct
+      `)) as unknown as any[];
+      return profile ? { ...profile, services, socialLinks: links, ...trust } : null;
     });
   }
 

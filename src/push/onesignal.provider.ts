@@ -53,4 +53,26 @@ export class OneSignalProvider {
       this.log.warn(`OneSignal send failed: ${(e as Error).message}`);
     }
   }
+
+  /** Generic visible push — normal priority/channel, unlike sendCall which is
+   *  tuned specifically for the incoming-call ring (forced channel, content_available). */
+  async sendNotification(playerIds: string[], title: string, body: string, data?: Record<string, string>) {
+    if (!this.enabled || playerIds.length === 0) return;
+    try {
+      const res = await fetch('https://onesignal.com/api/v1/notifications', {
+        method: 'POST',
+        headers: { Authorization: `Basic ${this.restKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          app_id: this.appId,
+          include_subscription_ids: playerIds,
+          ...(data ? { data } : {}),
+          headings: { en: title },
+          contents: { en: body },
+        }),
+      });
+      if (!res.ok) this.log.warn(`OneSignal ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    } catch (e) {
+      this.log.warn(`OneSignal send failed: ${(e as Error).message}`);
+    }
+  }
 }
