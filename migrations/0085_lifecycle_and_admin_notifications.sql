@@ -58,6 +58,9 @@ BEGIN
   SELECT id INTO v_wallet FROM public.wallets WHERE profile_id=p_fan;
   v_booking := gen_random_uuid();
 
+  -- Escrow always receives the FULL list price. The fan funds v_final of it;
+  -- the platform funds the rest. The promo leg is omitted entirely when there
+  -- is no discount, so undiscounted bookings post exactly as before.
   v_legs := jsonb_build_array(
       jsonb_build_object('wallet_id',v_wallet,'account','wallet','delta_paise',-v_final),
       jsonb_build_object('account','booking_escrow','delta_paise',v_base));
@@ -153,7 +156,7 @@ DECLARE b public.bookings; v_wallet uuid; v_res jsonb; v_mins int;
 BEGIN
   SELECT * INTO b FROM public.bookings WHERE id=p_booking FOR UPDATE;
   IF NOT FOUND THEN RETURN jsonb_build_object('success',false,'error','NOT_FOUND'); END IF;
-  PERFORM public.assert_caller(b.fan_id);
+  PERFORM public.assert_caller(b.fan_id);   -- fan self-service OR admin goodwill/dispute refund
   IF b.status NOT IN ('BOOKED') THEN
     RETURN jsonb_build_object('success',false,'error','NOT_REFUNDABLE','status',b.status); END IF;
   IF now() > b.settle_at THEN
@@ -164,6 +167,9 @@ BEGIN
 
   SELECT id INTO v_wallet FROM public.wallets WHERE profile_id=b.fan_id;
 
+  -- Unwinds the booking legs exactly: escrow releases the gross, the fan is
+  -- made whole for what they actually paid, and the platform's contribution
+  -- returns to the incentive pool rather than becoming a windfall for the fan.
   v_legs := jsonb_build_array(
       jsonb_build_object('account','booking_escrow','delta_paise',-v_gross),
       jsonb_build_object('wallet_id',v_wallet,'account','wallet','delta_paise',b.price_paise));

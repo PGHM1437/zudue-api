@@ -274,6 +274,20 @@ export class JobsService implements OnModuleInit, OnModuleDestroy {
                 jsonb_build_object('wallet_id',(select id from public.wallets where profile_id=${win.fan_id}),'account','wallet','delta_paise',${win.charge_paise})))`);
           // Only reached if the refund above didn't throw — same transaction.
           await tx.execute(sql`update public.conversation_windows set status='EXPIRED' where id=${win.id}`);
+          // runAsService does NOT bypass RLS on notifications (the policy has
+          // no service-role clause) — this must go through the SECURITY
+          // DEFINER RPC, same reason calls.module.ts does. Best-effort: a
+          // notification failure must not undo an already-committed refund.
+          await this.db.rpc(tx, 'rpc_create_notification', [
+            win.fan_id,
+            null,
+            sql`'QUESTION_EXPIRED_NO_RESPONSE_FAN'::public.notification_event_type_enum` as any,
+            'Question expired',
+            'Your question went unanswered in time and you have been refunded.',
+            sql`'question'::public.notification_related_entity_type_enum` as any,
+            win.id,
+            sql`'{}'::jsonb` as any,
+          ]).catch(() => undefined);
         });
         ok++;
       } catch (e) {

@@ -72,10 +72,8 @@ class DiscoveryService {
     return this.db.runAnon(async (tx) => {
       const [profile] = (await tx.execute(sql`
         select pp.profile_id, pp.display_name, pp.bio, pp.profile_image_path,
-               pp.is_premium, pp.is_featured, pp.status, pp.is_active, pp.vacation_mode
-               -- pp.languages intentionally omitted: migration 0082 was never applied
-               -- live (see identity.module.ts's me()). This is a PUBLIC endpoint hit by
-               -- every fan browsing any creator profile — restore once 0082 lands.
+               pp.is_premium, pp.is_featured, pp.status, pp.is_active, pp.vacation_mode,
+               pp.languages
         from public.partner_profiles pp where pp.profile_id = ${partnerId}
       `)) as unknown as any[];
       if (profile) profile.profile_image_path = toPublicMediaUrl(profile.profile_image_path, this.config.get<string>('R2_PUBLIC_MEDIA_URL'));

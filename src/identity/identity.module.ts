@@ -52,11 +52,7 @@ class IdentityService {
                p.verification_status, p.account_status, p.referral_code, p.notification_prefs,
                pp.display_name, pp.bio, pp.status as partner_status, pp.is_active,
                pp.vacation_mode, pp.is_premium, pp.is_featured, pp.profile_complete, pp.handle,
-               -- pp.languages intentionally omitted: migration 0082 (adds this column)
-               -- was never applied live. Referencing it here broke EVERY /me call with
-               -- an uncaught "column does not exist" — since /me fires immediately on
-               -- every sign-in and sign-up (meProvider watches auth state), this took
-               -- down auth entirely. Restore this line once 0082 is confirmed applied.
+               pp.languages,
                ${LIFECYCLE_SQL} as partner_lifecycle,
                -- Pending deletion is exposed here so the client can offer the
                -- cancel path during the grace period. Without it the app told
@@ -96,6 +92,8 @@ class IdentityService {
         values (${userId}, 'FAN'::public.user_role, ${b.fullName}, ${b.email ?? null}, ${b.mobileNumber ?? null})
         on conflict (id) do nothing
       `);
+      // Best-effort: a welcome notification failing must never block signup.
+      await this.db.rpc(tx, 'rpc_send_welcome_notification', [userId]).catch(() => undefined);
       return { created: true };
     });
   }
@@ -133,9 +131,17 @@ class IdentityService {
       const allowed = ['display_name', 'bio', 'profile_image_path', 'vacation_mode', 'profile_complete'];
       const sets = Object.entries(patch).filter(([k]) => allowed.includes(k));
       const assignments = sets.map(([k, v]) => sql`${sql.identifier(k)} = ${v as any}`);
-      // languages support removed: migration 0082 (adds partner_profiles.languages)
-      // was never applied live — this UPDATE would 500 on any partner who submits
-      // a language selection. Restore alongside the /me SELECT once 0082 lands.
+      // languages is text[] — interpolating a JS array directly renders as a
+      // record, not an array literal, and casting that to text[] fails ("cannot
+      // cast type record to text[]"); build it with an explicit ARRAY[...]
+      // constructor instead, same fix as setCategories in catalog.module.ts.
+      if (Array.isArray(patch.languages)) {
+        const langs = (patch.languages as string[]).map(String);
+        const arr = langs.length
+          ? sql`ARRAY[${sql.join(langs.map((s) => sql`${s}`), sql`, `)}]::text[]`
+          : sql`ARRAY[]::text[]`;
+        assignments.push(sql`languages = ${arr}`);
+      }
       // One UPDATE for every changed field, not one per field: editing
       // display_name + bio + a photo used to be 3 sequential round-trips.
       if (assignments.length) {
