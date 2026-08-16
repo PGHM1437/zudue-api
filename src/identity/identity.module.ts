@@ -51,7 +51,12 @@ class IdentityService {
         select p.id, p.role, p.full_name, p.email, p.mobile_number, p.age, p.gender,
                p.verification_status, p.account_status, p.referral_code, p.notification_prefs,
                pp.display_name, pp.bio, pp.status as partner_status, pp.is_active,
-               pp.vacation_mode, pp.is_premium, pp.is_featured, pp.profile_complete, pp.handle, pp.languages,
+               pp.vacation_mode, pp.is_premium, pp.is_featured, pp.profile_complete, pp.handle,
+               -- pp.languages intentionally omitted: migration 0082 (adds this column)
+               -- was never applied live. Referencing it here broke EVERY /me call with
+               -- an uncaught "column does not exist" — since /me fires immediately on
+               -- every sign-in and sign-up (meProvider watches auth state), this took
+               -- down auth entirely. Restore this line once 0082 is confirmed applied.
                ${LIFECYCLE_SQL} as partner_lifecycle,
                -- Pending deletion is exposed here so the client can offer the
                -- cancel path during the grace period. Without it the app told
@@ -128,13 +133,9 @@ class IdentityService {
       const allowed = ['display_name', 'bio', 'profile_image_path', 'vacation_mode', 'profile_complete'];
       const sets = Object.entries(patch).filter(([k]) => allowed.includes(k));
       const assignments = sets.map(([k, v]) => sql`${sql.identifier(k)} = ${v as any}`);
-      // languages is text[], not plain text — cast explicitly at the bind
-      // site, same reason gender/notification_prefs are cast in updateProfile
-      // above: an untyped array bind fails column-type resolution.
-      if (Array.isArray(patch.languages)) {
-        const langs = patch.languages.filter((l): l is string => typeof l === 'string');
-        assignments.push(sql`languages = ${langs}::text[]`);
-      }
+      // languages support removed: migration 0082 (adds partner_profiles.languages)
+      // was never applied live — this UPDATE would 500 on any partner who submits
+      // a language selection. Restore alongside the /me SELECT once 0082 lands.
       // One UPDATE for every changed field, not one per field: editing
       // display_name + bio + a photo used to be 3 sequential round-trips.
       if (assignments.length) {
