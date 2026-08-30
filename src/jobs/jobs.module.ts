@@ -4,6 +4,7 @@ import { Queue, Worker } from 'bullmq';
 import IORedis from 'ioredis';
 import { sql } from 'drizzle-orm';
 import { DatabaseService } from '../db/database.service';
+import { SupabaseAdminProvider } from '../identity/supabase-admin.provider';
 
 /**
  * The money-lifecycle scheduler — replaces the legacy (unscheduled) pg_cron.
@@ -23,7 +24,11 @@ export class JobsService implements OnModuleInit, OnModuleDestroy {
   private queue!: Queue;
   private worker!: Worker;
 
-  constructor(private readonly db: DatabaseService, private readonly config: ConfigService) {}
+  constructor(
+    private readonly db: DatabaseService,
+    private readonly config: ConfigService,
+    private readonly supabaseAdmin: SupabaseAdminProvider,
+  ) {}
 
   // ── Public methods for BullMQ monitoring ───────────────────────────────────
   isJobRunning(): boolean {
@@ -298,7 +303,21 @@ export class JobsService implements OnModuleInit, OnModuleDestroy {
     if (ok || failed) this.log.log(`expire-windows — refunded ${ok}/${ok + failed}`);
   }
 
-  /** Anonymise PII for accounts past their grace period (fixed: was a no-op). */
+  /**
+   * Anonymise PII for accounts past their grace period (fixed: was a no-op),
+   * then delete the actual Supabase Auth credential — without this second
+   * step the profile said "Deleted user" but the original email/password
+   * could still sign in and land on that anonymised, inactive profile.
+   *
+   * The auth-delete only runs AFTER rpc_purge_profile commits, and a failed
+   * auth-delete does NOT mark the request COMPLETED — it stays REQUESTED/
+   * CONFIRMED so the next sweep retries it (rpc_purge_profile is safe to
+   * re-run: idempotent UPDATEs and a DELETE that's a no-op once already
+   * empty). The one exception is SUPABASE_SERVICE_ROLE_KEY being unset
+   * entirely: that is a deployment-config gap, not a per-item failure, and
+   * must not stall every deletion request forever the way a real failure
+   * should — it completes as before (profile anonymised), logged loudly.
+   */
   private async purgeDeletions() {
     const due = await this.db.runAsService(async (tx) =>
       (await tx.execute(sql`
@@ -307,8 +326,17 @@ export class JobsService implements OnModuleInit, OnModuleDestroy {
 
     let ok = 0;
     let failed = 0;
+    let credentialsRetained = 0;
     for (const d of due) {
       try {
+        const authDeleted = this.supabaseAdmin.enabled ? await this.supabaseAdmin.deleteUser(d.profile_id) : true;
+        if (!authDeleted) {
+          failed++;
+          this.log.error(`purge: auth credential delete failed for ${d.profile_id} — leaving request open for retry`);
+          continue;
+        }
+        if (!this.supabaseAdmin.enabled) credentialsRetained++;
+
         await this.db.runAsService(async (tx) => {
           await this.db.rpc(tx, 'rpc_purge_profile', [d.profile_id]);
           await tx.execute(sql`update public.deletion_requests set status='COMPLETED', completed_at=now() where id=${d.id}`);
@@ -320,6 +348,7 @@ export class JobsService implements OnModuleInit, OnModuleDestroy {
       }
     }
     if (ok || failed) this.log.log(`purge — anonymised ${ok}/${ok + failed} accounts`);
+    if (credentialsRetained) this.log.warn(`purge — ${credentialsRetained} account(s) anonymised but their login credential was NOT deleted (SUPABASE_SERVICE_ROLE_KEY not configured)`);
   }
 
   /**

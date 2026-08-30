@@ -8,6 +8,11 @@ const schema = z.object({
   AUTH_JWKS_URL: z.string().url(),
   AUTH_ISSUER: z.string(),
   AUTH_AUDIENCE: z.string().default('authenticated'),
+  // GoTrue admin API — deletes the actual auth.users row (credentials) once
+  // the deletion-request grace period elapses. Optional like every other
+  // integration here: unset means the purge sweep anonymises profile data but
+  // leaves the login intact, logged loudly rather than failing the sweep.
+  SUPABASE_SERVICE_ROLE_KEY: z.string().optional(),
   RAZORPAY_KEY_ID: z.string().optional(),
   RAZORPAY_KEY_SECRET: z.string().optional(),
   RAZORPAY_WEBHOOK_SECRET: z.string().optional(),

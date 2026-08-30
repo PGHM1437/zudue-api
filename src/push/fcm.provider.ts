@@ -40,15 +40,30 @@ export class FcmProvider {
    * Data-only high-priority send to many tokens. Returns dead tokens.
    *
    * `platform` is optional (older/backfilled rows may not have it) and
-   * defaults to 'android' — this codebase has never shipped an iOS build, so
-   * every token in production today is Android. When one isn't, the message
-   * only carries the block matching ITS platform: sending `apns-push-type:
-   * voip` to an Android token was harmless (FCM ignores blocks that don't
-   * match the token's platform), but sending it to a real iOS token would
-   * actively break delivery — VoIP pushes require a separate PushKit
-   * certificate/entitlement from a normal APNs push, which this app has never
-   * been configured for. Better to omit the block than assert a push type
-   * this app cannot actually deliver.
+   * defaults to 'android'. Each message carries only the block matching ITS
+   * platform — sending an `apns` block to an Android token is harmless (FCM
+   * ignores blocks that don't match), but the two need genuinely different
+   * headers, so branching is not cosmetic.
+   *
+   * iOS uses `apns-push-type: background`, NOT `voip`. A VoIP push requires a
+   * PushKit registration and a separate VoIP APNs certificate; this app has
+   * neither (ios/Runner/Info.plist deliberately does not declare the `voip`
+   * background mode, and nothing registers with PushKit). Asserting
+   * `apns-push-type: voip` without that certificate makes APNs REJECT the
+   * push outright, so every iOS call ring would silently fail to arrive —
+   * which is exactly what would have happened the moment a real iOS token
+   * existed. `background` is what this app can actually deliver today.
+   *
+   * The trade-off is real and worth stating plainly: iOS throttles background
+   * pushes and does not guarantee they wake a killed app, so killed-state
+   * ringing stays unreliable on iOS until PushKit is implemented. That is a
+   * platform constraint, not something a header can work around. Android is
+   * unaffected — high-priority data still punches through Doze as before.
+   *
+   * Header rules are APNs': `background` REQUIRES `apns-priority: 5` (APNs
+   * rejects priority 10 for that type) and a `content-available: 1` payload,
+   * and `apns-expiration` is an absolute unix timestamp rather than the
+   * relative TTL Android takes.
    */
   async sendData(
     tokens: Array<{ token: string; platform?: string }>,
@@ -71,7 +86,16 @@ export class FcmProvider {
               token,
               data,
               ...(isIos
-                ? { apns: { headers: { 'apns-priority': '10', 'apns-push-type': 'voip' } } }
+                ? {
+                    apns: {
+                      headers: {
+                        'apns-priority': '5',
+                        'apns-push-type': 'background',
+                        'apns-expiration': `${Math.floor(Date.now() / 1000) + ttlSeconds}`,
+                      },
+                      payload: { aps: { 'content-available': 1 } },
+                    },
+                  }
                 : { android: { priority: 'high', ttl: `${ttlSeconds}s`, direct_boot_ok: true } }),
             },
           }),

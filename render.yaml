@@ -36,18 +36,25 @@ services:
         value: https://jlmmpdupapuknhsnudeu.supabase.co/auth/v1
       - key: AUTH_AUDIENCE
         value: authenticated
+      # GoTrue admin key — the ONLY place this app holds elevated Supabase
+      # access, used solely to delete the auth.users row once an account
+      # deletion request's grace period elapses (rpc_purge_profile can only
+      # reach app-owned tables, not auth.users itself). Optional: unset means
+      # the purge sweep still anonymises profile data, just leaves the login
+      # credential intact — logged loudly when that happens, never silent.
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
 
       # ── CORS ──────────────────────────────────────────────────────────
       - key: CORS_ORIGINS
         value: https://zudue.com,https://www.zudue.com,https://admin.zudue.com,https://zudue-app.vercel.app,https://zudue-2-0.vercel.app
 
       # ── Redis ─────────────────────────────────────────────────────────
-      # Was absent entirely. JobsModule reads it with getOrThrow at boot, and
-      # BullMQ drives settlement, stalled-call sweeps and monthly payouts — the
-      # money lifecycle does not run without it. Point this at a Render Key
-      # Value instance (or any reachable Redis).
+      # Using Supabase Redis (managed Redis instance).
+      # JobsModule reads this at boot - BullMQ drives settlement, stalled-call
+      # sweeps and monthly payouts — the money lifecycle requires this.
       - key: REDIS_URL
-        sync: false
+        value: redis://default:pTioppn3sgRmtjuzJY7XwomvN2V9ujri@taste-macrosolid-laurel-35421.db.redis.io:15498
 
       # ── Storage ───────────────────────────────────────────────────────
       # The previous S3_* keys were never read by this codebase — R2Provider

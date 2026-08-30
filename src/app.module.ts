@@ -11,6 +11,7 @@ import { PushModule } from './push/push.module';
 import { StorageModule } from './storage/storage.module';
 import { WalletModule } from './wallet/wallet.module';
 import { IdentityModule } from './identity/identity.module';
+import { SupabaseAdminModule } from './identity/supabase-admin.provider';
 import { ReferralsModule } from './referrals/referrals.module';
 import { DiscoveryModule } from './discovery/discovery.module';
 import { CatalogModule } from './catalog/catalog.module';
@@ -37,6 +38,7 @@ import { AdminSettingsModule } from './admin/admin-settings.module';
     PaymentsModule,
     PushModule,
     StorageModule,
+    SupabaseAdminModule,
     // domains
     IdentityModule,
     ReferralsModule,
