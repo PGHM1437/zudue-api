@@ -49,10 +49,20 @@ services:
       - key: CORS_ORIGINS
         value: https://zudue.com,https://www.zudue.com,https://admin.zudue.com,https://zudue-app.vercel.app,https://zudue-2-0.vercel.app
 
+      # ── Lifecycle scheduler ───────────────────────────────────────────
+      # 'pgcron' (default): the money/call lifecycle (settle, stalled-call
+      # sweep, no-show refunds, DM-window expiry) runs inside Postgres via
+      # pg_cron — see migration 0090. This is deliberate: the old in-process
+      # BullMQ worker only ran while this web service was awake, and Render
+      # idles it on no traffic, so settlement silently paused for days
+      # (verified 2026-08-30). pg_cron keeps running regardless.
+      # Set to 'bullmq' ONLY alongside an always-on service + a live REDIS_URL.
+      - key: JOBS_DRIVER
+        value: pgcron
+
       # ── Redis ─────────────────────────────────────────────────────────
-      # Using Supabase Redis (managed Redis instance).
-      # JobsModule reads this at boot - BullMQ drives settlement, stalled-call
-      # sweeps and monthly payouts — the money lifecycle requires this.
+      # Only consumed when JOBS_DRIVER=bullmq. Left here so the fallback path
+      # still works; harmless when unused. (Redis Cloud free instance.)
       - key: REDIS_URL
         value: redis://default:pTioppn3sgRmtjuzJY7XwomvN2V9ujri@taste-macrosolid-laurel-35421.db.redis.io:15498
 

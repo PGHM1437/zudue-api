@@ -30,12 +30,30 @@ export class JobsService implements OnModuleInit, OnModuleDestroy {
     private readonly supabaseAdmin: SupabaseAdminProvider,
   ) {}
 
-  // ── Public methods for BullMQ monitoring ───────────────────────────────────
+  private get driver(): 'pgcron' | 'bullmq' {
+    return (this.config.get<string>('JOBS_DRIVER') ?? 'pgcron') === 'bullmq' ? 'bullmq' : 'pgcron';
+  }
+
+  // ── Public methods for lifecycle monitoring ────────────────────────────────
   isJobRunning(): boolean {
+    // Under pg_cron the scheduler lives in the database, not this process —
+    // the honest signal is whether cron is executing the jobs, which
+    // lifecycleHealth() reports. This boolean stays true so the admin panel's
+    // legacy "connected" indicator doesn't read as an outage.
+    if (this.driver === 'pgcron') return true;
     return this.connection ? this.connection.status === 'ready' : false;
   }
 
   getJobs() {
+    if (this.driver === 'pgcron') {
+      return {
+        'zudue-sweep-calls': { pattern: '* * * * *' },
+        'zudue-settle': { pattern: '*/5 * * * *' },
+        'zudue-expire-windows': { pattern: '*/5 * * * *' },
+        'zudue-cleanup-topups': { pattern: '30 2 * * *' },
+        'zudue-purge-deletions': { pattern: '0 3 * * *' },
+      };
+    }
     return {
       settle: { pattern: '*/15 * * * *' },
       'stalled-calls': { pattern: '* * * * *' },
@@ -45,8 +63,53 @@ export class JobsService implements OnModuleInit, OnModuleDestroy {
     };
   }
 
+  /**
+   * Real lifecycle-scheduler health. Under pg_cron this reads the actual last
+   * run + status of every zudue-* job straight from the database, which is the
+   * one place that tells you whether settlement and the call sweeps are
+   * actually firing (the previous "redis_connected" flag couldn't).
+   */
+  async lifecycleHealth(): Promise<Record<string, unknown>> {
+    if (this.driver === 'bullmq') {
+      return { driver: 'bullmq', worker_ready: this.isJobRunning(), jobs: this.getJobs() };
+    }
+    try {
+      const rows = (await this.db.runAsService(async (tx) =>
+        tx.execute(sql`
+          select j.jobname, j.schedule, j.active,
+                 r.status       as last_status,
+                 r.start_time   as last_run,
+                 r.end_time     as last_finished,
+                 r.return_message
+          from cron.job j
+          left join lateral (
+            select status, start_time, end_time, return_message
+            from cron.job_run_details d
+            where d.jobid = j.jobid
+            order by d.start_time desc
+            limit 1
+          ) r on true
+          where j.jobname like 'zudue-%'
+          order by j.jobname
+        `),
+      )) as unknown as any[];
+      return { driver: 'pgcron', jobs: rows };
+    } catch (e) {
+      return { driver: 'pgcron', error: (e as Error).message };
+    }
+  }
+
   // ── OnModuleInit implementation ────────────────────────────────────────────
   async onModuleInit() {
+    if (this.driver === 'pgcron') {
+      // The lifecycle is scheduled by pg_cron inside the database (migration
+      // 0090). Nothing to run in-process — and crucially, nothing that stops
+      // when Render idles this web service. Set JOBS_DRIVER=bullmq to restore
+      // the in-process worker.
+      this.log.log('lifecycle scheduler: pg_cron (in-process BullMQ worker disabled)');
+      return;
+    }
+
     const redisUrl = this.config.get('REDIS_URL');
     if (!redisUrl) {
       this.log.warn('REDIS_URL not configured - background jobs will be disabled');

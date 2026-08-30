@@ -5,6 +5,14 @@ const schema = z.object({
   PORT: z.coerce.number().default(3000),
   DATABASE_URL: z.string().url(),
   REDIS_URL: z.string().url().optional(),
+  // Which scheduler drives the money/call lifecycle (settle, stalled-call
+  // sweep, no-show refunds, DM-window expiry).
+  //   'pgcron' (default) — pg_cron runs the job_* functions inside the DB
+  //     (migration 0090). No always-on worker; keeps running when the web
+  //     service idles. This is the fix for the "worker dies on idle" bug.
+  //   'bullmq' — the legacy in-process BullMQ worker. Needs REDIS_URL AND a
+  //     web service that never sleeps.
+  JOBS_DRIVER: z.enum(['pgcron', 'bullmq']).default('pgcron'),
   AUTH_JWKS_URL: z.string().url(),
   AUTH_ISSUER: z.string(),
   AUTH_AUDIENCE: z.string().default('authenticated'),
