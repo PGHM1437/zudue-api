@@ -22,24 +22,32 @@
 -- 1-3: process_end_of_day_expired_bookings, cleanup_stalled_calls, …).
 --
 -- The in-process BullMQ path stays in the code but is disabled by default
--- (JOBS_DRIVER=pgcron); set JOBS_DRIVER=bullmq to fall back to it.
+-- (JOBS_DRIVER=pgcron); set JOBS_DRIVER=bullmq to fall back to it. Both are
+-- idempotent (row locks + partner_earnings_service_uq + already_settled guards),
+-- so a brief overlap during rollout is safe.
 --
--- NOTE ON purge-deletions: job_purge_deletions() runs rpc_purge_profile (the
--- PII anonymisation) but NOT the GoTrue auth.users credential delete, which
--- needs the Supabase admin API. That step was already unreachable in
--- production (SUPABASE_SERVICE_ROLE_KEY is sync:false / unset and the provider
--- is not yet deployed), so this is not a regression. Follow-up: drive it from
--- pg_net or a tiny dedicated worker.
+-- SECURITY
+-- These functions self-elevate (set app.is_service_role) so the assert_system()
+-- guards inside the rpc_* pass. That guard is the ONLY thing standing between a
+-- public anon key and a settlement run — verified: POST /rest/v1/rpc/
+-- process_end_of_day_expired_bookings with the anon key reaches assert_system()
+-- today. So each job_* is (a) REVOKEd from every PostgREST-reachable role and
+-- (b) refuses to run from a session that carries an end-user identity.
+--
+-- NOTE ON purge-deletions: job_purge_deletions() runs rpc_purge_profile (PII
+-- anonymisation) only — not the GoTrue auth.users credential delete, nor the R2
+-- KYC object delete. Both were already app-side responsibilities the BullMQ job
+-- did not perform in production (SUPABASE_SERVICE_ROLE_KEY unset), so this is
+-- not a regression. Follow-up: drive them from pg_net or a dedicated worker.
 
 BEGIN;
 
 -- ── 1. sweeper functions ────────────────────────────────────────────────────
--- Every function: SECURITY DEFINER, pinned empty search_path (db-doctor
--- SECDEF_PATH), and sets app.is_service_role for the transaction so the
--- assert_system() / assert_caller_any() guards inside the rpc_* functions
--- accept it — identical to what DatabaseService.runAsService does in the app.
+-- Each: SECURITY DEFINER + pinned empty search_path (db-doctor SECDEF_PATH);
+-- refuse an end-user session; then set service context for the txn.
 
 -- 1a. Calls: deadline auto-complete, stale-heartbeat drop, fan-no-join sweep.
+--     Backed by call_deadline_idx / call_heartbeat_idx / call_active_idx.
 CREATE OR REPLACE FUNCTION public.job_sweep_calls()
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -53,6 +61,9 @@ DECLARE
   v_failed    int := 0;
   v_sweep     jsonb;
 BEGIN
+  IF coalesce(current_setting('app.user_id', true), '') <> '' THEN
+    RAISE EXCEPTION 'job_sweep_calls is a system sweep, not callable from a user session';
+  END IF;
   PERFORM set_config('app.is_service_role', 'true', true);
 
   -- IN_PROGRESS past its deterministic deadline → auto-complete (→ settlement).
@@ -72,10 +83,9 @@ BEGIN
   END LOOP;
 
   -- IN_PROGRESS but the freshest heartbeat from EITHER party is > 60s old →
-  -- both sides are gone, drop it as a technical issue. (greatest() over the two
-  -- last-heartbeat columns, coalesced to started_at, matches the previous
-  -- BullMQ query exactly — a call where one side is still beating survives and
-  -- resolves at its deadline instead.)
+  -- both sides are gone, drop it. greatest() over the two last-heartbeat columns
+  -- coalesced to started_at matches the previous BullMQ query exactly — a call
+  -- where one side is still beating survives and resolves at its deadline.
   FOR r IN
     SELECT id FROM public.calls
     WHERE attempt_status = 'IN_PROGRESS'
@@ -93,8 +103,13 @@ BEGIN
   END LOOP;
 
   -- PARTNER_INITIATED, fan never joined within the ring window → no-join.
-  -- cleanup_stalled_calls() is already self-contained and assert_system-gated.
-  v_sweep := public.cleanup_stalled_calls();
+  -- cleanup_stalled_calls() is self-contained and assert_system-gated.
+  BEGIN
+    v_sweep := public.cleanup_stalled_calls();
+  EXCEPTION WHEN OTHERS THEN
+    v_sweep := jsonb_build_object('error', SQLERRM);
+    RAISE WARNING 'job_sweep_calls: cleanup_stalled_calls failed: %', SQLERRM;
+  END;
 
   RETURN jsonb_build_object(
     'success', true,
@@ -107,8 +122,10 @@ END $fn$;
 
 -- 1b. Settlement: expire overdue bookings, then settle everything past its
 --     settle_at (bookings, paid DM windows, shout-outs), plus shout-out
---     auto-confirm / expiry. Order matters: expiry FIRST so a booking reaches
---     its terminal status before the settle filter looks at it.
+--     auto-confirm / expiry. Expiry FIRST so a booking reaches its terminal
+--     status before the settle filter looks at it. Every driving query is
+--     served by a purpose-built partial index (booking_settle_due_idx,
+--     conversation_window_settle_due_idx, shoutout_*_due_idx).
 CREATE OR REPLACE FUNCTION public.job_settle()
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -124,9 +141,17 @@ DECLARE
   v_exp_ok     int := 0; v_exp_fail   int := 0;
   v_so_ok      int := 0; v_so_fail    int := 0;
 BEGIN
+  IF coalesce(current_setting('app.user_id', true), '') <> '' THEN
+    RAISE EXCEPTION 'job_settle is a system sweep, not callable from a user session';
+  END IF;
   PERFORM set_config('app.is_service_role', 'true', true);
 
-  v_expiry := public.process_end_of_day_expired_bookings();
+  BEGIN
+    v_expiry := public.process_end_of_day_expired_bookings();
+  EXCEPTION WHEN OTHERS THEN
+    v_expiry := jsonb_build_object('error', SQLERRM);
+    RAISE WARNING 'job_settle: process_end_of_day_expired_bookings failed: %', SQLERRM;
+  END;
 
   FOR r IN
     SELECT b.id FROM public.bookings b
@@ -201,7 +226,8 @@ END $fn$;
 -- 1c. Paid DM windows unanswered past their deadline → refund the fan.
 --     Port of JobsService.expireWindows(): the refund and the status flip are
 --     one atomic unit per window (a failed refund rolls back the whole
---     iteration and the window stays OPEN for the next run).
+--     iteration and the window stays OPEN for the next run). Served by
+--     window_open_idx.
 CREATE OR REPLACE FUNCTION public.job_expire_windows()
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -214,6 +240,9 @@ DECLARE
   v_failed int := 0;
   v_wallet uuid;
 BEGIN
+  IF coalesce(current_setting('app.user_id', true), '') <> '' THEN
+    RAISE EXCEPTION 'job_expire_windows is a system sweep, not callable from a user session';
+  END IF;
   PERFORM set_config('app.is_service_role', 'true', true);
 
   FOR r IN
@@ -240,8 +269,6 @@ BEGIN
       );
       UPDATE public.conversation_windows SET status = 'EXPIRED' WHERE id = r.id;
 
-      -- best-effort: a notification failure must not undo a committed refund,
-      -- but it is inside this iteration's savepoint so it just logs.
       BEGIN
         PERFORM public.rpc_create_notification(
           r.fan_id, NULL,
@@ -265,8 +292,8 @@ BEGIN
   RETURN jsonb_build_object('success', true, 'refunded', v_ok, 'failed', v_failed);
 END $fn$;
 
--- 1d. Abandoned Razorpay checkouts → FAILED. rpc_cleanup_abandoned_topups()
---     is a single self-contained statement; this just supplies service context.
+-- 1d. Abandoned Razorpay checkouts → FAILED. rpc_cleanup_abandoned_topups() is
+--     a single self-contained statement; this just supplies service context.
 CREATE OR REPLACE FUNCTION public.job_cleanup_topups()
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -274,12 +301,15 @@ SECURITY DEFINER
 SET search_path TO ''
 AS $fn$
 BEGIN
+  IF coalesce(current_setting('app.user_id', true), '') <> '' THEN
+    RAISE EXCEPTION 'job_cleanup_topups is a system sweep, not callable from a user session';
+  END IF;
   PERFORM set_config('app.is_service_role', 'true', true);
   RETURN public.rpc_cleanup_abandoned_topups();
 END $fn$;
 
--- 1e. Account-deletion PII purge (grace period elapsed). Does NOT delete the
---     GoTrue credential — see the migration header note.
+-- 1e. Account-deletion PII purge (grace period elapsed). See header note on
+--     what this deliberately does NOT do. Served by deletion_requests_purge_idx.
 CREATE OR REPLACE FUNCTION public.job_purge_deletions()
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -291,6 +321,9 @@ DECLARE
   v_ok int := 0;
   v_failed int := 0;
 BEGIN
+  IF coalesce(current_setting('app.user_id', true), '') <> '' THEN
+    RAISE EXCEPTION 'job_purge_deletions is a system sweep, not callable from a user session';
+  END IF;
   PERFORM set_config('app.is_service_role', 'true', true);
 
   FOR r IN
@@ -311,44 +344,53 @@ BEGIN
   RETURN jsonb_build_object('success', true, 'purged', v_ok, 'failed', v_failed);
 END $fn$;
 
--- Least privilege: these are for pg_cron (runs as the table owner) only. Revoke
--- the default PUBLIC EXECUTE so no end-user session can invoke a sweep.
-REVOKE ALL ON FUNCTION public.job_sweep_calls()      FROM PUBLIC;
-REVOKE ALL ON FUNCTION public.job_settle()           FROM PUBLIC;
-REVOKE ALL ON FUNCTION public.job_expire_windows()   FROM PUBLIC;
-REVOKE ALL ON FUNCTION public.job_cleanup_topups()   FROM PUBLIC;
-REVOKE ALL ON FUNCTION public.job_purge_deletions()  FROM PUBLIC;
+-- Lock these to pg_cron (which runs as the owner). Supabase's ALTER DEFAULT
+-- PRIVILEGES auto-grants EXECUTE to PUBLIC + anon/authenticated/service_role/
+-- zudue_app on every new public function — and these functions self-elevate to
+-- service role, so leaving any of those grants makes them a
+-- POST /rest/v1/rpc/<name> escalation endpoint. Revoke all of them; the owner
+-- keeps EXECUTE implicitly. (anon/authenticated/service_role are created by
+-- 0000, zudue_app by 0025 — all exist before this runs.)
+REVOKE ALL ON FUNCTION public.job_sweep_calls()     FROM PUBLIC, anon, authenticated, service_role, zudue_app;
+REVOKE ALL ON FUNCTION public.job_settle()          FROM PUBLIC, anon, authenticated, service_role, zudue_app;
+REVOKE ALL ON FUNCTION public.job_expire_windows()  FROM PUBLIC, anon, authenticated, service_role, zudue_app;
+REVOKE ALL ON FUNCTION public.job_cleanup_topups()  FROM PUBLIC, anon, authenticated, service_role, zudue_app;
+REVOKE ALL ON FUNCTION public.job_purge_deletions() FROM PUBLIC, anon, authenticated, service_role, zudue_app;
 
--- ── 2. enable pg_cron and schedule ──────────────────────────────────────────
--- Wrapped so a Postgres without pg_cron in shared_preload_libraries (a vanilla
--- CI image) still applies the functions above and records the migration — the
--- scheduling is a no-op there and logged. On Supabase pg_cron IS preloaded, so
--- this creates the extension and the jobs for real.
+-- ── 2. schedule (pg_cron must already be enabled) ───────────────────────────
+-- pg_cron's control file requires a superuser to CREATE EXTENSION, and the
+-- migration role is not one — so enabling the extension is a one-time project
+-- action, not something this migration does. On Supabase: Dashboard → Database →
+-- Extensions → pg_cron, or SQL Editor `create extension pg_cron;`. Then run
+-- `pnpm db:migrate`. cron.schedule() upserts by job name, so 0090 is replay-safe.
 --
--- If it logs "pg_cron unavailable" against your live database, enable pg_cron
--- once from the Supabase dashboard (Database → Extensions → pg_cron) and
--- re-run `pnpm db:migrate` (0090 replays; cron.schedule upserts by name).
---
--- Standard 5-field cron (1-minute floor) everywhere for portability; tighten
--- 'zudue-sweep-calls' to '30 seconds' once you've confirmed the project allows
--- sub-minute jobs. The client also learns a terminal status within one 15s
--- heartbeat (migration 0088), so 60s here is a backstop, not the primary path.
+-- Standard 5-field cron (1-minute floor) everywhere for portability. The client
+-- also learns a terminal status within one 15s heartbeat (migration 0088), so
+-- the 60s call-sweep cadence is a backstop, not the primary path.
 DO $cron$
 BEGIN
   IF coalesce(current_setting('shared_preload_libraries', true), '') NOT LIKE '%pg_cron%' THEN
-    RAISE NOTICE '0090: pg_cron is not in shared_preload_libraries — job_* functions created, scheduling skipped. On Supabase, enable pg_cron (Database → Extensions), then re-run `pnpm db:migrate`.';
+    RAISE NOTICE '0090: pg_cron not preloaded — job_* functions applied, scheduling skipped (expected on CI / local Postgres).';
     RETURN;
   END IF;
 
-  EXECUTE 'CREATE EXTENSION IF NOT EXISTS pg_cron';
+  IF to_regclass('cron.job') IS NULL THEN
+    RAISE EXCEPTION USING
+      message = '0090 needs the pg_cron extension enabled. Enable it once (Supabase Dashboard -> Database -> Extensions -> pg_cron, or SQL Editor: create extension pg_cron;), then re-run pnpm db:migrate. Nothing was applied.',
+      errcode = 'feature_not_supported';
+  END IF;
 
-  -- cron.schedule() upserts by job name → this block is safe to replay.
-  EXECUTE $q$ SELECT cron.schedule('zudue-sweep-calls',     '* * * * *',   'SELECT public.job_sweep_calls()') $q$;
-  EXECUTE $q$ SELECT cron.schedule('zudue-settle',          '*/5 * * * *', 'SELECT public.job_settle()') $q$;
-  EXECUTE $q$ SELECT cron.schedule('zudue-expire-windows',  '*/5 * * * *', 'SELECT public.job_expire_windows()') $q$;
-  EXECUTE $q$ SELECT cron.schedule('zudue-cleanup-topups',  '30 2 * * *',  'SELECT public.job_cleanup_topups()') $q$;
-  EXECUTE $q$ SELECT cron.schedule('zudue-purge-deletions', '0 3 * * *',   'SELECT public.job_purge_deletions()') $q$;
-  RAISE NOTICE '0090: pg_cron lifecycle jobs scheduled (zudue-*)';
+  PERFORM cron.schedule('zudue-sweep-calls',        '* * * * *',   'SELECT public.job_sweep_calls()');
+  PERFORM cron.schedule('zudue-settle',             '*/5 * * * *', 'SELECT public.job_settle()');
+  PERFORM cron.schedule('zudue-expire-windows',     '*/5 * * * *', 'SELECT public.job_expire_windows()');
+  PERFORM cron.schedule('zudue-cleanup-topups',     '30 2 * * *',  'SELECT public.job_cleanup_topups()');
+  PERFORM cron.schedule('zudue-purge-deletions',    '0 3 * * *',   'SELECT public.job_purge_deletions()');
+  -- pg_cron writes one cron.job_run_details row per run and never prunes it
+  -- (6 jobs, sweep-calls every minute → ~1.5k rows/day). Keep 7 days.
+  PERFORM cron.schedule('zudue-cron-log-retention', '17 4 * * *',
+    $q$DELETE FROM cron.job_run_details WHERE end_time < now() - interval '7 days'$q$);
+
+  RAISE NOTICE '0090: 6 pg_cron jobs scheduled (zudue-*)';
 END
 $cron$;
 
