@@ -4,6 +4,7 @@ import { Queue, Worker } from 'bullmq';
 import IORedis from 'ioredis';
 import { sql } from 'drizzle-orm';
 import { DatabaseService } from '../db/database.service';
+import { SupabaseAdminProvider } from '../identity/supabase-admin.provider';
 
 /**
  * The money-lifecycle scheduler — replaces the legacy (unscheduled) pg_cron.
@@ -23,14 +24,36 @@ export class JobsService implements OnModuleInit, OnModuleDestroy {
   private queue!: Queue;
   private worker!: Worker;
 
-  constructor(private readonly db: DatabaseService, private readonly config: ConfigService) {}
+  constructor(
+    private readonly db: DatabaseService,
+    private readonly config: ConfigService,
+    private readonly supabaseAdmin: SupabaseAdminProvider,
+  ) {}
 
-  // ── Public methods for BullMQ monitoring ───────────────────────────────────
+  private get driver(): 'pgcron' | 'bullmq' {
+    return (this.config.get<string>('JOBS_DRIVER') ?? 'pgcron') === 'bullmq' ? 'bullmq' : 'pgcron';
+  }
+
+  // ── Public methods for lifecycle monitoring ────────────────────────────────
   isJobRunning(): boolean {
+    // Under pg_cron the scheduler lives in the database, not this process —
+    // the honest signal is whether cron is executing the jobs, which
+    // lifecycleHealth() reports. This boolean stays true so the admin panel's
+    // legacy "connected" indicator doesn't read as an outage.
+    if (this.driver === 'pgcron') return true;
     return this.connection ? this.connection.status === 'ready' : false;
   }
 
   getJobs() {
+    if (this.driver === 'pgcron') {
+      return {
+        'zudue-sweep-calls': { pattern: '* * * * *' },
+        'zudue-settle': { pattern: '*/5 * * * *' },
+        'zudue-expire-windows': { pattern: '*/5 * * * *' },
+        'zudue-cleanup-topups': { pattern: '30 2 * * *' },
+        'zudue-purge-deletions': { pattern: '0 3 * * *' },
+      };
+    }
     return {
       settle: { pattern: '*/15 * * * *' },
       'stalled-calls': { pattern: '* * * * *' },
@@ -40,8 +63,53 @@ export class JobsService implements OnModuleInit, OnModuleDestroy {
     };
   }
 
+  /**
+   * Real lifecycle-scheduler health. Under pg_cron this reads the actual last
+   * run + status of every zudue-* job straight from the database, which is the
+   * one place that tells you whether settlement and the call sweeps are
+   * actually firing (the previous "redis_connected" flag couldn't).
+   */
+  async lifecycleHealth(): Promise<Record<string, unknown>> {
+    if (this.driver === 'bullmq') {
+      return { driver: 'bullmq', worker_ready: this.isJobRunning(), jobs: this.getJobs() };
+    }
+    try {
+      const rows = (await this.db.runAsService(async (tx) =>
+        tx.execute(sql`
+          select j.jobname, j.schedule, j.active,
+                 r.status       as last_status,
+                 r.start_time   as last_run,
+                 r.end_time     as last_finished,
+                 r.return_message
+          from cron.job j
+          left join lateral (
+            select status, start_time, end_time, return_message
+            from cron.job_run_details d
+            where d.jobid = j.jobid
+            order by d.start_time desc
+            limit 1
+          ) r on true
+          where j.jobname like 'zudue-%'
+          order by j.jobname
+        `),
+      )) as unknown as any[];
+      return { driver: 'pgcron', jobs: rows };
+    } catch (e) {
+      return { driver: 'pgcron', error: (e as Error).message };
+    }
+  }
+
   // ── OnModuleInit implementation ────────────────────────────────────────────
   async onModuleInit() {
+    if (this.driver === 'pgcron') {
+      // The lifecycle is scheduled by pg_cron inside the database (migration
+      // 0090). Nothing to run in-process — and crucially, nothing that stops
+      // when Render idles this web service. Set JOBS_DRIVER=bullmq to restore
+      // the in-process worker.
+      this.log.log('lifecycle scheduler: pg_cron (in-process BullMQ worker disabled)');
+      return;
+    }
+
     const redisUrl = this.config.get('REDIS_URL');
     if (!redisUrl) {
       this.log.warn('REDIS_URL not configured - background jobs will be disabled');
@@ -298,7 +366,21 @@ export class JobsService implements OnModuleInit, OnModuleDestroy {
     if (ok || failed) this.log.log(`expire-windows — refunded ${ok}/${ok + failed}`);
   }
 
-  /** Anonymise PII for accounts past their grace period (fixed: was a no-op). */
+  /**
+   * Anonymise PII for accounts past their grace period (fixed: was a no-op),
+   * then delete the actual Supabase Auth credential — without this second
+   * step the profile said "Deleted user" but the original email/password
+   * could still sign in and land on that anonymised, inactive profile.
+   *
+   * The auth-delete only runs AFTER rpc_purge_profile commits, and a failed
+   * auth-delete does NOT mark the request COMPLETED — it stays REQUESTED/
+   * CONFIRMED so the next sweep retries it (rpc_purge_profile is safe to
+   * re-run: idempotent UPDATEs and a DELETE that's a no-op once already
+   * empty). The one exception is SUPABASE_SERVICE_ROLE_KEY being unset
+   * entirely: that is a deployment-config gap, not a per-item failure, and
+   * must not stall every deletion request forever the way a real failure
+   * should — it completes as before (profile anonymised), logged loudly.
+   */
   private async purgeDeletions() {
     const due = await this.db.runAsService(async (tx) =>
       (await tx.execute(sql`
@@ -307,8 +389,17 @@ export class JobsService implements OnModuleInit, OnModuleDestroy {
 
     let ok = 0;
     let failed = 0;
+    let credentialsRetained = 0;
     for (const d of due) {
       try {
+        const authDeleted = this.supabaseAdmin.enabled ? await this.supabaseAdmin.deleteUser(d.profile_id) : true;
+        if (!authDeleted) {
+          failed++;
+          this.log.error(`purge: auth credential delete failed for ${d.profile_id} — leaving request open for retry`);
+          continue;
+        }
+        if (!this.supabaseAdmin.enabled) credentialsRetained++;
+
         await this.db.runAsService(async (tx) => {
           await this.db.rpc(tx, 'rpc_purge_profile', [d.profile_id]);
           await tx.execute(sql`update public.deletion_requests set status='COMPLETED', completed_at=now() where id=${d.id}`);
@@ -320,6 +411,7 @@ export class JobsService implements OnModuleInit, OnModuleDestroy {
       }
     }
     if (ok || failed) this.log.log(`purge — anonymised ${ok}/${ok + failed} accounts`);
+    if (credentialsRetained) this.log.warn(`purge — ${credentialsRetained} account(s) anonymised but their login credential was NOT deleted (SUPABASE_SERVICE_ROLE_KEY not configured)`);
   }
 
   /**

@@ -187,16 +187,26 @@ class CallsService {
           where b.id = ${bookingId}
         `)) as unknown as Array<{ partner_id: string; full_name: string | null }>;
         if (rows[0]) {
+          const fanName = rows[0].full_name ?? 'A fan';
           await this.createCallNotification(tx, {
             recipientId: rows[0].partner_id,
             actorId: userId,
             eventType: 'VIDEO_CALL_FAN_READY_PARTNER',
             title: 'Fan is ready',
-            message: `${rows[0].full_name ?? 'The fan'} is ready for your call`,
+            message: `${fanName} is ready for your call`,
             relatedEntityType: 'booking',
             relatedEntityId: bookingId,
             metadata: { bookingId },
           });
+          // Push it too — the partner's queue only polls every 20s, and a fan
+          // waiting on the line shouldn't sit unseen. Visible notification, not
+          // a call ring.
+          this.push
+            .notifyQueueNext(rows[0].partner_id, 'Fan is ready', `${fanName} is ready — start the call when you are.`, {
+              type: 'fan_ready',
+              bookingId,
+            })
+            .catch(() => undefined);
         }
       }
       return res;
@@ -296,8 +306,24 @@ class CallsService {
   heartbeat(userId: string, callId: string, actor: 'FAN' | 'PARTNER') {
     return this.db.runAs(userId, (tx) => this.db.rpc(tx, 'rpc_call_heartbeat', [callId, actor]));
   }
-  complete(userId: string, callId: string) {
-    return this.db.runAs(userId, (tx) => this.db.rpc(tx, 'rpc_complete_call', [callId, false]));
+  async complete(userId: string, callId: string) {
+    return this.db.runAs(userId, async (tx) => {
+      const res = await this.db.rpc(tx, 'rpc_complete_call', [callId, false]);
+      if (res?.success) {
+        // Push the other party's call screen to tear down now, not on its next
+        // heartbeat. rpc_complete_call may have resolved this to a drop/review
+        // rather than a full completion — either way the live call is over.
+        const rows = (await tx.execute(sql`
+          select fan_id, partner_id, booking_id from public.calls where id = ${callId}
+        `)) as unknown as Array<{ fan_id: string; partner_id: string; booking_id: string }>;
+        if (rows[0]) {
+          this.push
+            .notifyCallEnded([rows[0].fan_id, rows[0].partner_id], callId, rows[0].booking_id)
+            .catch(() => undefined);
+        }
+      }
+      return res;
+    });
   }
   /** Allow-list: the client sends this value, and it lands in a call_status
    *  enum arg. Validate here so a bad value is a clean 400 rather than a DB
@@ -316,9 +342,14 @@ class CallsService {
         // stalled-call sweep. The fan's own CallKit decline/timeout also calls
         // this endpoint — cancelCall back to that same device is a harmless
         // no-op (endCall on an already-dismissed ring).
-        const rows = (await tx.execute(sql`select fan_id, booking_id from public.calls where id = ${callId}`)) as unknown as Array<{ fan_id: string; booking_id: string }>;
+        const rows = (await tx.execute(sql`select fan_id, partner_id, booking_id from public.calls where id = ${callId}`)) as unknown as Array<{ fan_id: string; partner_id: string; booking_id: string }>;
         if (rows[0]) {
           this.push.cancelCall(rows[0].fan_id, callId).catch(() => undefined);
+          // If both were mid-call (a technical drop), the partner's screen is
+          // still open — end it now. Also a no-op for a fan who was only ringing.
+          this.push
+            .notifyCallEnded([rows[0].fan_id, rows[0].partner_id], callId, rows[0].booking_id)
+            .catch(() => undefined);
 
           // Persist a missed-call notification so the fan sees it even if
           // they dismissed the push. Only for actual miss statuses, not drops.

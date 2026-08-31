@@ -36,18 +36,35 @@ services:
         value: https://jlmmpdupapuknhsnudeu.supabase.co/auth/v1
       - key: AUTH_AUDIENCE
         value: authenticated
+      # GoTrue admin key — the ONLY place this app holds elevated Supabase
+      # access, used solely to delete the auth.users row once an account
+      # deletion request's grace period elapses (rpc_purge_profile can only
+      # reach app-owned tables, not auth.users itself). Optional: unset means
+      # the purge sweep still anonymises profile data, just leaves the login
+      # credential intact — logged loudly when that happens, never silent.
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
 
       # ── CORS ──────────────────────────────────────────────────────────
       - key: CORS_ORIGINS
         value: https://zudue.com,https://www.zudue.com,https://admin.zudue.com,https://zudue-app.vercel.app,https://zudue-2-0.vercel.app
 
+      # ── Lifecycle scheduler ───────────────────────────────────────────
+      # 'pgcron' (default): the money/call lifecycle (settle, stalled-call
+      # sweep, no-show refunds, DM-window expiry) runs inside Postgres via
+      # pg_cron — see migration 0090. This is deliberate: the old in-process
+      # BullMQ worker only ran while this web service was awake, and Render
+      # idles it on no traffic, so settlement silently paused for days
+      # (verified 2026-08-30). pg_cron keeps running regardless.
+      # Set to 'bullmq' ONLY alongside an always-on service + a live REDIS_URL.
+      - key: JOBS_DRIVER
+        value: pgcron
+
       # ── Redis ─────────────────────────────────────────────────────────
-      # Was absent entirely. JobsModule reads it with getOrThrow at boot, and
-      # BullMQ drives settlement, stalled-call sweeps and monthly payouts — the
-      # money lifecycle does not run without it. Point this at a Render Key
-      # Value instance (or any reachable Redis).
+      # Only consumed when JOBS_DRIVER=bullmq. Left here so the fallback path
+      # still works; harmless when unused. (Redis Cloud free instance.)
       - key: REDIS_URL
-        sync: false
+        value: redis://default:pTioppn3sgRmtjuzJY7XwomvN2V9ujri@taste-macrosolid-laurel-35421.db.redis.io:15498
 
       # ── Storage ───────────────────────────────────────────────────────
       # The previous S3_* keys were never read by this codebase — R2Provider
@@ -66,21 +83,32 @@ services:
       - key: R2_PUBLIC_MEDIA_URL
         sync: false
 
-      # ── Optional integrations ─────────────────────────────────────────
-      # Read at request time, so an unset value fails only its own endpoint,
-      # never the boot. Set in the dashboard rather than committed.
+      # ── Video (Agora) — REQUIRED for calls to connect ─────────────────
+      # APP_ID is a public identifier (also in the mobile client); the
+      # CERTIFICATE is secret. Both must be set in the dashboard or every
+      # GET /calls/token/:meetingId 500s and no call can start.
       - key: AGORA_APP_ID
-        sync: false
+        value: e5eede7c5e11466b854d2c6d279d482f
       - key: AGORA_APP_CERTIFICATE
         sync: false
+
+      # ── Push (FCM) — REQUIRED to ring the fan ─────────────────────────
+      # FCM_SERVICE_ACCOUNT_B64 = base64 of the Firebase service-account JSON
+      # (project zudue-59abf). Secret. Without it FcmProvider.enabled is false
+      # and sendIncomingCall / notifyCallEnded silently send nothing.
+      - key: FCM_PROJECT_ID
+        value: zudue-59abf
+      - key: FCM_SERVICE_ACCOUNT_B64
+        sync: false
+
+      # ── Optional integrations ─────────────────────────────────────────
       - key: RAZORPAY_KEY_ID
         sync: false
       - key: RAZORPAY_KEY_SECRET
         sync: false
       - key: RAZORPAY_WEBHOOK_SECRET
         sync: false
-      - key: FCM_SERVICE_ACCOUNT_B64
-        sync: false
+      # OneSignal is the redundant push path — unset today; FCM alone rings.
       - key: ONESIGNAL_APP_ID
         sync: false
       - key: ONESIGNAL_REST_API_KEY

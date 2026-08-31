@@ -115,8 +115,14 @@ class IdentityService {
         gender: (v) => sql`gender = ${v == null ? null : sql`${v}::public.gender_enum`}`,
         notification_prefs: (v) => sql`notification_prefs = ${JSON.stringify(v)}::jsonb`,
       };
+      // v !== undefined matters: with tsconfig's ES2022 target, every
+      // @IsOptional() field on UpdateProfileDto materialises as a real own
+      // property (value undefined) even when the client never sent it —
+      // class-transformer's "define" field semantics, not "absent". Without
+      // this filter, an untouched `age` field reached Number(undefined) =
+      // NaN and 500'd every PUT /me, including ones that never mentioned age.
       const parts = Object.entries(patch)
-        .filter(([k]) => k in setters)
+        .filter(([k, v]) => k in setters && v !== undefined)
         .map(([k, v]) => setters[k](v));
       if (!parts.length) return { updated: false };
       await tx.execute(
@@ -129,7 +135,12 @@ class IdentityService {
   updatePartnerProfile(userId: string, patch: Record<string, unknown>) {
     return this.db.runAs(userId, async (tx) => {
       const allowed = ['display_name', 'bio', 'profile_image_path', 'vacation_mode', 'profile_complete'];
-      const sets = Object.entries(patch).filter(([k]) => allowed.includes(k));
+      // Same ES2022-class-field issue as updateProfile above: display_name
+      // and profile_complete are NOT NULL, so without the v !== undefined
+      // guard, availability_screen's single-field
+      // updatePartnerProfile({vacation_mode: ...}) call bound NULL into both
+      // and hard-failed with a not-null constraint violation on every toggle.
+      const sets = Object.entries(patch).filter(([k, v]) => allowed.includes(k) && v !== undefined);
       const assignments = sets.map(([k, v]) => sql`${sql.identifier(k)} = ${v as any}`);
       // languages is text[] — interpolating a JS array directly renders as a
       // record, not an array literal, and casting that to text[] fails ("cannot

@@ -67,17 +67,17 @@ class AdminSettingsService {
   }
 
   /**
-   * BullMQ monitoring - Redis connection status and scheduled jobs.
-   * This exposes the internal state of the background job scheduler.
+   * Lifecycle-scheduler health. Under the default pg_cron driver this reports
+   * the real last-run time + status of each zudue-* cron job from the database;
+   * under bullmq it reports the in-process worker's Redis connection.
    */
-  bullmqStatus(userId: string) {
-    const redisUrl = this.config.get('REDIS_URL');
-    
+  async bullmqStatus(_userId: string) {
+    const health = await this.jobs.lifecycleHealth();
     return {
-      redis_url_set: !!redisUrl,
+      redis_url_set: !!this.config.get('REDIS_URL'),
       redis_connected: this.jobs.isJobRunning(),
       queue_connected: this.jobs.isJobRunning(),
-      jobs: this.jobs.getJobs(),
+      ...health,
     };
   }
 }
