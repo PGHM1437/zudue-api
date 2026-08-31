@@ -14,15 +14,16 @@
 -- genuine completion.
 --
 -- The manual path now classifies by how much of the booked time actually ran
--- and whether BOTH sides sent heartbeats:
+-- and whether the PARTNER was really connected (a heartbeat from the partner —
+-- fan_last_heartbeat_at is seeded at join and proves nothing):
 --   • ran ~the full booked time            → COMPLETED_SUCCESSFUL (unchanged)
---   • >= 45s AND both parties heartbeated   → attempt COMPLETED, booking
---                                             REQUIRES_ADMIN_REVIEW (admin
+--   • >= 45s AND partner heartbeated (>=2   → attempt COMPLETED, booking
+--     total beats)                            REQUIRES_ADMIN_REVIEW (admin
 --                                             splits escrow via
 --                                             rpc_admin_resolve_partial_call —
 --                                             same path 0066a / 0077 use)
---   • otherwise (barely connected, or one
---     side never present)                   → attempt DROPPED_TECHNICAL_ISSUE,
+--   • otherwise (barely connected, or the
+--     partner never really joined)          → attempt DROPPED_TECHNICAL_ISSUE,
 --                                             booking stays BOOKED and retryable
 --                                             (trg_reset_fan_ready clears
 --                                             fan_ready_at); if no attempt ever
@@ -45,13 +46,13 @@ CREATE OR REPLACE FUNCTION public.rpc_complete_call(p_call uuid, p_auto boolean 
  SET search_path TO ''
 AS $function$
 DECLARE
-  c            public.calls;
-  v_booked_s   int;
-  v_elapsed_s  int;
-  v_both_beat  boolean;
-  v_outcome    text;          -- 'COMPLETE' | 'REVIEW' | 'DROP'
-  v_call_status public.call_status;
-  v_term       text;
+  c              public.calls;
+  v_booked_s     int;
+  v_elapsed_s    int;
+  v_both_present  boolean;
+  v_outcome      text;        -- 'COMPLETE' | 'REVIEW' | 'DROP'
+  v_call_status  public.call_status;
+  v_term         text;
 BEGIN
   SELECT * INTO c FROM public.calls WHERE id = p_call FOR UPDATE;
   IF NOT FOUND OR c.attempt_status <> 'IN_PROGRESS' THEN
@@ -74,12 +75,18 @@ BEGIN
     SELECT (selected_duration::text)::int * 60 INTO v_booked_s
       FROM public.bookings WHERE id = c.booking_id;
     v_booked_s := COALESCE(NULLIF(v_booked_s, 0), 60);
-    v_both_beat := c.fan_last_heartbeat_at IS NOT NULL
-               AND c.partner_last_heartbeat_at IS NOT NULL;
+    -- "Both sides were really connected." rpc_fan_join_call SEEDS
+    -- fan_last_heartbeat_at at join, so it is always non-null for an
+    -- IN_PROGRESS call and proves nothing. The real signal is a heartbeat FROM
+    -- THE PARTNER (never seeded — only rpc_call_heartbeat sets it) plus a
+    -- non-trivial beat count (heartbeat_count is bumped by every real beat from
+    -- either side, and is NOT touched by the join seed).
+    v_both_present := c.partner_last_heartbeat_at IS NOT NULL
+                  AND c.heartbeat_count >= 2;
 
     IF v_elapsed_s >= (v_booked_s * 3 / 4) OR v_elapsed_s >= v_booked_s - 30 THEN
       v_outcome := 'COMPLETE';
-    ELSIF v_elapsed_s >= 45 AND v_both_beat THEN
+    ELSIF v_elapsed_s >= 45 AND v_both_present THEN
       v_outcome := 'REVIEW';
     ELSE
       v_outcome := 'DROP';
