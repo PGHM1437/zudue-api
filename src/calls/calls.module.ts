@@ -1,9 +1,8 @@
 import { BadRequestException, Body, Controller, ForbiddenException, Get, Injectable, Module, Param, ParseUUIDPipe, Post, Query, UseGuards } from '@nestjs/common';
 import { BookCallDto, HeartbeatDto, MarkMissedDto, PreviewPriceDto } from './calls.dto';
-import { ConfigService } from '@nestjs/config';
 import { sql } from 'drizzle-orm';
-import { RtcTokenBuilder, RtcRole } from 'agora-token';
 import { DatabaseService, Tx } from '../db/database.service';
+import { CallCredentialProvider, AgoraCredentialProvider } from './call-credential.provider';
 import { PushService } from '../push/push.service';
 import { JwtGuard } from '../auth/jwt.guard';
 import { AuthUser, CurrentUser } from '../auth/current-user.decorator';
@@ -19,8 +18,8 @@ import { AuthUser, CurrentUser } from '../auth/current-user.decorator';
 class CallsService {
   constructor(
     private readonly db: DatabaseService,
-    private readonly config: ConfigService,
     private readonly push: PushService,
+    private readonly credentials: CallCredentialProvider,
   ) {}
 
   /** C6 fix (0079): cross-user notification inserts (partner→fan, fan→partner)
@@ -300,11 +299,32 @@ class CallsService {
       return res;
     });
   }
-  join(userId: string, bookingId: string) {
-    return this.db.runAs(userId, (tx) => this.db.rpc(tx, 'rpc_fan_join_call', [bookingId]));
+  async join(userId: string, bookingId: string) {
+    return this.db.runAs(userId, async (tx) => {
+      const res = await this.db.rpc(tx, 'rpc_fan_join_call', [bookingId]);
+      // The fan joining is what sets the hard deadline (join + booked minutes).
+      // Hand it back so the client counts down locally instead of leaning on
+      // the heartbeat's remaining_seconds. Null before IN_PROGRESS -- the
+      // client falls back to the heartbeat in that case.
+      if (res?.success && res.call_id) {
+        const [row] = (await tx.execute(
+          sql`select deadline_at from public.calls where id = ${res.call_id}`,
+        )) as unknown as Array<{ deadline_at: string | null }>;
+        return { ...res, deadline_at: row?.deadline_at ?? null };
+      }
+      return res;
+    });
   }
-  heartbeat(userId: string, callId: string, actor: 'FAN' | 'PARTNER') {
-    return this.db.runAs(userId, (tx) => this.db.rpc(tx, 'rpc_call_heartbeat', [callId, actor]));
+  /**
+   * 60s liveness beat + the one signal the completion resolver needs:
+   * `peerPresent` -- the fan's app says whether it can currently see the
+   * creator's video. The DB sticky-sets calls.partner_media_confirmed from it;
+   * rpc_complete_call refuses to pay a call the fan never saw the creator on.
+   * Optional so an older client (no flag) falls back to 0091 behaviour.
+   */
+  heartbeat(userId: string, callId: string, actor: 'FAN' | 'PARTNER', peerPresent?: boolean) {
+    return this.db.runAs(userId, (tx) =>
+      this.db.rpc(tx, 'rpc_call_heartbeat', [callId, actor, peerPresent ?? null]));
   }
   async complete(userId: string, callId: string) {
     return this.db.runAs(userId, async (tx) => {
@@ -371,7 +391,11 @@ class CallsService {
     });
   }
 
-  /** Short-lived Agora RTC token for a meeting the caller is a party to. */
+  /**
+   * A join credential for a meeting the caller is a party to. Shape is
+   * provider-neutral; the concrete token comes from CallCredentialProvider,
+   * the one place the media provider exists on the server.
+   */
   async agoraToken(userId: string, meetingId: string) {
     return this.db.runAs(userId, async (tx) => {
       const rows = (await tx.execute(sql`
@@ -382,12 +406,7 @@ class CallsService {
       // exception filter and renders as an opaque 500, so a fan opening a call
       // they aren't party to got "Internal server error" instead of a clear 403.
       if (!rows.length) throw new ForbiddenException('NOT_A_PARTY');
-      const appId = this.config.getOrThrow<string>('AGORA_APP_ID');
-      const cert = this.config.getOrThrow<string>('AGORA_APP_CERTIFICATE');
-      const uid = 0; // string-account tokens could use userId; 0 = let SDK assign
-      const expire = Math.floor(Date.now() / 1000) + 3600;
-      const token = RtcTokenBuilder.buildTokenWithUid(appId, cert, meetingId, uid, RtcRole.PUBLISHER, expire, expire);
-      return { appId, channel: meetingId, token, uid };
+      return this.credentials.mint(meetingId);
     });
   }
 }
@@ -411,11 +430,18 @@ class CallsController {
   @UseGuards(JwtGuard) @Post(':bookingId/ready') ready(@CurrentUser() u: AuthUser, @Param('bookingId', ParseUUIDPipe) id: string) { return this.svc.signalReady(u.id, id); }
   @UseGuards(JwtGuard) @Post(':bookingId/initiate') init(@CurrentUser() u: AuthUser, @Param('bookingId', ParseUUIDPipe) id: string) { return this.svc.initiate(u.id, id); }
   @UseGuards(JwtGuard) @Post(':bookingId/join') join(@CurrentUser() u: AuthUser, @Param('bookingId', ParseUUIDPipe) id: string) { return this.svc.join(u.id, id); }
-  @UseGuards(JwtGuard) @Post('call/:callId/heartbeat') hb(@CurrentUser() u: AuthUser, @Param('callId', ParseUUIDPipe) id: string, @Body() b: HeartbeatDto) { return this.svc.heartbeat(u.id, id, b.actor); }
+  @UseGuards(JwtGuard) @Post('call/:callId/heartbeat') hb(@CurrentUser() u: AuthUser, @Param('callId', ParseUUIDPipe) id: string, @Body() b: HeartbeatDto) { return this.svc.heartbeat(u.id, id, b.actor, b.peerPresent); }
   @UseGuards(JwtGuard) @Post('call/:callId/complete') done(@CurrentUser() u: AuthUser, @Param('callId', ParseUUIDPipe) id: string) { return this.svc.complete(u.id, id); }
   @UseGuards(JwtGuard) @Post('call/:callId/missed') miss(@CurrentUser() u: AuthUser, @Param('callId', ParseUUIDPipe) id: string, @Body() b: MarkMissedDto) { return this.svc.markMissed(u.id, id, b.status); }
   @UseGuards(JwtGuard) @Get('token/:meetingId') token(@CurrentUser() u: AuthUser, @Param('meetingId') m: string) { return this.svc.agoraToken(u.id, m); }
 }
 
-@Module({ controllers: [CallsController], providers: [CallsService] })
+@Module({
+  controllers: [CallsController],
+  providers: [
+    CallsService,
+    // The one media-provider seam. Swap useClass to move off Agora.
+    { provide: CallCredentialProvider, useClass: AgoraCredentialProvider },
+  ],
+})
 export class CallsModule {}

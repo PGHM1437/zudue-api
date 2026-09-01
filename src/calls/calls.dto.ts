@@ -1,4 +1,4 @@
-import { IsIn, IsOptional, IsString, IsUUID, Matches, MaxLength } from 'class-validator';
+import { IsBoolean, IsIn, IsOptional, IsString, IsUUID, Matches, MaxLength } from 'class-validator';
 
 /**
  * Request shapes for CallsController.
@@ -47,6 +47,13 @@ export class PreviewPriceDto {
 
 export class HeartbeatDto {
   @IsIn(['FAN', 'PARTNER']) actor!: 'FAN' | 'PARTNER';
+  /**
+   * The fan app's answer to "can I currently see the creator's video?".
+   * Sticky-recorded on calls.partner_media_confirmed; rpc_complete_call will
+   * not pay a call the fan never saw the creator on. Optional -- an older
+   * client that omits it falls back to 0091 completion behaviour.
+   */
+  @IsOptional() @IsBoolean() peerPresent?: boolean;
 }
 
 /**

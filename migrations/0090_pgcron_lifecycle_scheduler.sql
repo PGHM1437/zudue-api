@@ -357,6 +357,15 @@ REVOKE ALL ON FUNCTION public.job_expire_windows()  FROM PUBLIC, anon, authentic
 REVOKE ALL ON FUNCTION public.job_cleanup_topups()  FROM PUBLIC, anon, authenticated, service_role, zudue_app;
 REVOKE ALL ON FUNCTION public.job_purge_deletions() FROM PUBLIC, anon, authenticated, service_role, zudue_app;
 
+-- The underlying settle/sweep functions the job_* wrappers call are ALSO
+-- assert_system()-gated self-elevators reachable at POST /rest/v1/rpc/<name>
+-- with the anon key today (verified against the live DB). assert_system() is a
+-- backstop, not the front door -- revoke the grants too. The owner (pg_cron and
+-- the SECURITY DEFINER job_* wrappers) keeps EXECUTE implicitly; the in-process
+-- BullMQ fallback connects as the owner as well.
+REVOKE ALL ON FUNCTION public.process_end_of_day_expired_bookings() FROM PUBLIC, anon, authenticated, service_role, zudue_app;
+REVOKE ALL ON FUNCTION public.cleanup_stalled_calls()               FROM PUBLIC, anon, authenticated, service_role, zudue_app;
+
 -- ── 2. schedule (pg_cron must already be enabled) ───────────────────────────
 -- pg_cron's control file requires a superuser to CREATE EXTENSION, and the
 -- migration role is not one — so enabling the extension is a one-time project
