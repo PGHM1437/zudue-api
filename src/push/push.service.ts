@@ -132,7 +132,7 @@ export class PushService {
 
   /**
    * Tell both parties a live call has ended — so an open call screen tears
-   * down at once instead of waiting for its next 15s heartbeat. Data-only,
+   * down at once instead of waiting for its next 60s heartbeat. Data-only,
    * short TTL; harmless to a device that isn't on the call.
    */
   async notifyCallEnded(recipientIds: string[], callId: string, bookingId: string) {

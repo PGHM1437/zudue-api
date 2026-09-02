@@ -1,5 +1,5 @@
 import { BadRequestException, Body, Controller, ForbiddenException, Get, Injectable, Module, Param, ParseUUIDPipe, Post, Query, UseGuards } from '@nestjs/common';
-import { BookCallDto, HeartbeatDto, MarkMissedDto, PreviewPriceDto } from './calls.dto';
+import { BookCallDto, HeartbeatDto, MarkMissedDto, PreviewPriceDto, RecordCallMetricsDto } from './calls.dto';
 import { sql } from 'drizzle-orm';
 import { DatabaseService, Tx } from '../db/database.service';
 import { CallCredentialProvider, AgoraCredentialProvider } from './call-credential.provider';
@@ -11,8 +11,8 @@ import { AuthUser, CurrentUser } from '../auth/current-user.decorator';
  * Calls — bold domain. Booking + the call state machine
  * (initiate → ready → join → heartbeat → complete | missed | dropped) with a
  * deterministic deadline. Every state transition is a certified DB RPC; this
- * service adds the Agora token (rented) and exposes read models. Stalled/missed
- * sweeps live in JobsModule (BullMQ), not here.
+ * service mints the media-join credential (provider-neutral) and exposes read
+ * models. Stalled/missed sweeps live in the lifecycle scheduler, not here.
  */
 @Injectable()
 class CallsService {
@@ -393,10 +393,11 @@ class CallsService {
 
   /**
    * A join credential for a meeting the caller is a party to. Shape is
-   * provider-neutral; the concrete token comes from CallCredentialProvider,
-   * the one place the media provider exists on the server.
+   * provider-neutral ({ provider, room, token, appId }); the concrete token
+   * comes from CallCredentialProvider, the one place the media provider exists
+   * on the server.
    */
-  async agoraToken(userId: string, meetingId: string) {
+  async callCredential(userId: string, meetingId: string) {
     return this.db.runAs(userId, async (tx) => {
       const rows = (await tx.execute(sql`
         select 1 from public.calls where meeting_id = ${meetingId}
@@ -408,6 +409,21 @@ class CallsService {
       if (!rows.length) throw new ForbiddenException('NOT_A_PARTY');
       return this.credentials.mint(meetingId);
     });
+  }
+
+  /**
+   * A participant's own session summary, written once on teardown. Telemetry
+   * only — rpc_record_call_metrics writes calls.metadata.clientMetrics.<role>
+   * and nothing else, so this can never affect how the call resolves. The
+   * controller calls it fire-and-forget; a failure must not reach the client's
+   * exit path.
+   */
+  recordMetrics(userId: string, callId: string, metrics: Record<string, unknown>) {
+    return this.db.runAs(userId, (tx) =>
+      this.db.rpc(tx, 'rpc_record_call_metrics', [
+        callId,
+        sql`${JSON.stringify(metrics)}::jsonb` as any,
+      ]));
   }
 }
 
@@ -433,7 +449,17 @@ class CallsController {
   @UseGuards(JwtGuard) @Post('call/:callId/heartbeat') hb(@CurrentUser() u: AuthUser, @Param('callId', ParseUUIDPipe) id: string, @Body() b: HeartbeatDto) { return this.svc.heartbeat(u.id, id, b.actor, b.peerPresent); }
   @UseGuards(JwtGuard) @Post('call/:callId/complete') done(@CurrentUser() u: AuthUser, @Param('callId', ParseUUIDPipe) id: string) { return this.svc.complete(u.id, id); }
   @UseGuards(JwtGuard) @Post('call/:callId/missed') miss(@CurrentUser() u: AuthUser, @Param('callId', ParseUUIDPipe) id: string, @Body() b: MarkMissedDto) { return this.svc.markMissed(u.id, id, b.status); }
-  @UseGuards(JwtGuard) @Get('token/:meetingId') token(@CurrentUser() u: AuthUser, @Param('meetingId') m: string) { return this.svc.agoraToken(u.id, m); }
+  // Fire-and-forget teardown telemetry. Swallows failure — a metrics write must
+  // never surface on the client's exit path (calls.module recordMetrics note).
+  @UseGuards(JwtGuard) @Post('call/:callId/metrics') metrics(@CurrentUser() u: AuthUser, @Param('callId', ParseUUIDPipe) id: string, @Body() b: RecordCallMetricsDto) {
+    return this.svc.recordMetrics(u.id, id, b.metrics).catch(() => ({ success: false }));
+  }
+  // `:meetingId` is exempt from ParseUUIDPipe: calls.meeting_id is text
+  // ('zudue-<uuid>'), not uuid. `/calls/:meetingId/credential` is the canonical
+  // route; `/calls/token/:meetingId` is kept as a one-release alias for clients
+  // still on the old path.
+  @UseGuards(JwtGuard) @Get(':meetingId/credential') credential(@CurrentUser() u: AuthUser, @Param('meetingId') m: string) { return this.svc.callCredential(u.id, m); }
+  @UseGuards(JwtGuard) @Get('token/:meetingId') token(@CurrentUser() u: AuthUser, @Param('meetingId') m: string) { return this.svc.callCredential(u.id, m); }
 }
 
 @Module({

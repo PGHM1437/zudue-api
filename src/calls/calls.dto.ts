@@ -1,4 +1,4 @@
-import { IsBoolean, IsIn, IsOptional, IsString, IsUUID, Matches, MaxLength } from 'class-validator';
+import { IsBoolean, IsIn, IsObject, IsOptional, IsString, IsUUID, Matches, MaxLength } from 'class-validator';
 
 /**
  * Request shapes for CallsController.
@@ -65,4 +65,16 @@ export class HeartbeatDto {
 export class MarkMissedDto {
   @IsIn(['MISSED_FAN_NO_JOIN', 'MISSED_FAN_DECLINED', 'DROPPED_TECHNICAL_ISSUE'])
   status!: string;
+}
+
+/**
+ * A call participant's own session summary, POSTed once on teardown
+ * (fire-and-forget). Lands in calls.metadata.clientMetrics.<role> via
+ * rpc_record_call_metrics — telemetry only, never touches call state. `role` is
+ * echoed inside `metrics` too; the RPC keys on that. Kept loose (any object)
+ * because the exact fields will evolve with the client and this is diagnostic
+ * data, not a contract — the RPC caps it at 4KB and pins recordedAt server-side.
+ */
+export class RecordCallMetricsDto {
+  @IsObject() metrics!: Record<string, unknown>;
 }
