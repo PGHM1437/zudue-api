@@ -89,6 +89,41 @@ class CallsService {
       `)) as unknown as any[]);
   }
 
+  /**
+   * The caller's own live call attempt, if any — for the app-wide guard that
+   * stops someone wandering off into the rest of the app while a call they are
+   * a party to is still ringing or running.
+   *
+   * PARTNER_INITIATED is included deliberately, not just IN_PROGRESS: for the
+   * fan that is a phone ringing right now, and for the creator it is an attempt
+   * they started and must see through. Both are states where "go and deal with
+   * this" is the only sensible next action.
+   *
+   * Always returns an object so a client can distinguish "no active call" from
+   * a failed request; a bare null body cannot carry that difference.
+   */
+  activeCall(userId: string) {
+    return this.db.runAs(userId, async (tx) => {
+      const rows = (await tx.execute(sql`
+        select c.id as call_id,
+               c.booking_id,
+               c.attempt_status::text as attempt_status,
+               (c.partner_id = ${userId}) as as_partner,
+               case when c.partner_id = ${userId}
+                    then coalesce(fp.full_name, 'Fan')
+                    else coalesce(pp.display_name, 'Creator') end as other_party_name
+        from public.calls c
+        left join public.profiles fp on fp.id = c.fan_id
+        left join public.partner_profiles pp on pp.profile_id = c.partner_id
+        where (c.fan_id = ${userId} or c.partner_id = ${userId})
+          and c.attempt_status in ('PARTNER_INITIATED','IN_PROGRESS')
+        order by c.partner_initiated_at desc nulls last
+        limit 1
+      `)) as unknown as any[];
+      return { active: rows[0] ?? null };
+    });
+  }
+
   partnerQueue(userId: string) {
     return this.db.runAs(userId, async (tx) =>
       (await tx.execute(sql`select * from public.vw_partner_call_queue where partner_id = ${userId}`)) as unknown as any[]);
@@ -307,6 +342,13 @@ class CallsService {
       // the heartbeat's remaining_seconds. Null before IN_PROGRESS -- the
       // client falls back to the heartbeat in that case.
       if (res?.success && res.call_id) {
+        // The fan answered HERE. Every other device they own is still ringing
+        // for this same call and will keep ringing until the 45s CallKit
+        // window lapses — at which point that device reports a timeout and
+        // marks a call the fan is actively on as MISSED_FAN_NO_JOIN. Stop the
+        // ring everywhere now. Harmless on the answering device: its CallKit
+        // entry is already ended, so endCall there is a no-op.
+        this.push.cancelCall(userId, res.call_id).catch(() => undefined);
         const [row] = (await tx.execute(
           sql`select deadline_at from public.calls where id = ${res.call_id}`,
         )) as unknown as Array<{ deadline_at: string | null }>;
@@ -337,8 +379,12 @@ class CallsService {
           select fan_id, partner_id, booking_id from public.calls where id = ${callId}
         `)) as unknown as Array<{ fan_id: string; partner_id: string; booking_id: string }>;
         if (rows[0]) {
+          // rpc_complete_call decides whether this was a real completion or a
+          // drop (too short, or the fan never confirmed seeing the creator).
+          // Send THAT, so the other party's outcome card matches the money.
+          const status = res.completed === false ? 'DROPPED_TECHNICAL_ISSUE' : 'COMPLETED_SUCCESSFUL';
           this.push
-            .notifyCallEnded([rows[0].fan_id, rows[0].partner_id], callId, rows[0].booking_id)
+            .notifyCallEnded([rows[0].fan_id, rows[0].partner_id], callId, rows[0].booking_id, status)
             .catch(() => undefined);
         }
       }
@@ -368,7 +414,7 @@ class CallsService {
           // If both were mid-call (a technical drop), the partner's screen is
           // still open — end it now. Also a no-op for a fan who was only ringing.
           this.push
-            .notifyCallEnded([rows[0].fan_id, rows[0].partner_id], callId, rows[0].booking_id)
+            .notifyCallEnded([rows[0].fan_id, rows[0].partner_id], callId, rows[0].booking_id, status)
             .catch(() => undefined);
 
           // Persist a missed-call notification so the fan sees it even if
@@ -437,6 +483,9 @@ class CallsController {
   @UseGuards(JwtGuard) @Get('bookings') bookings(@CurrentUser() u: AuthUser) { return this.svc.myBookings(u.id); }
   @UseGuards(JwtGuard) @Get('operational-hours') operationalHours() { return this.svc.operationalHours(); }
   @UseGuards(JwtGuard) @Get('queue') queue(@CurrentUser() u: AuthUser) { return this.svc.partnerQueue(u.id); }
+  // Literal path, declared alongside the other single-segment literals and well
+  // clear of ':meetingId/credential' (two segments) — no route ambiguity.
+  @UseGuards(JwtGuard) @Get('active') active(@CurrentUser() u: AuthUser) { return this.svc.activeCall(u.id); }
   @UseGuards(JwtGuard) @Get('history') history(@CurrentUser() u: AuthUser) { return this.svc.partnerHistory(u.id); }
   @UseGuards(JwtGuard) @Get('upcoming') upcoming(@CurrentUser() u: AuthUser) { return this.svc.partnerUpcoming(u.id); }
   // bookingId/callId are uuid columns — ParseUUIDPipe turns a malformed id into

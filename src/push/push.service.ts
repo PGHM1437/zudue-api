@@ -134,15 +134,23 @@ export class PushService {
    * Tell both parties a live call has ended — so an open call screen tears
    * down at once instead of waiting for its next 60s heartbeat. Data-only,
    * short TTL; harmless to a device that isn't on the call.
+   *
+   * `status` is the call_status the server actually resolved this to. It has
+   * to travel with the push: without it the receiving client had nothing to go
+   * on and assumed COMPLETED_SUCCESSFUL, so a creator whose fan declined — or
+   * whose call was written off as a technical drop and refunded — was still
+   * shown "Call complete. Your booked call time is complete." The outcome card
+   * is the only place either party learns how the call resolved, so it must
+   * carry the truth, not the happy case.
    */
-  async notifyCallEnded(recipientIds: string[], callId: string, bookingId: string) {
+  async notifyCallEnded(recipientIds: string[], callId: string, bookingId: string, status: string) {
     const ids = [...new Set(recipientIds.filter(Boolean))];
     if (!ids.length) return;
     await this.db.runAsService(async (tx) => {
       const rows = (await tx.execute(sql`
         select fcm_token, onesignal_player_id, platform from public.push_tokens where profile_id = any(${ids})
       `)) as unknown as Array<{ fcm_token: string | null; onesignal_player_id: string | null; platform: string | null }>;
-      const data = { type: 'call_ended', callId, bookingId };
+      const data = { type: 'call_ended', callId, bookingId, status };
       const fcmTokens = rows
         .filter((r): r is typeof r & { fcm_token: string } => !!r.fcm_token)
         .map((r) => ({ token: r.fcm_token, platform: r.platform ?? undefined }));
