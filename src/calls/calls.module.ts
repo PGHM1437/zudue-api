@@ -83,7 +83,29 @@ class CallsService {
     return this.db.runAs(userId, async (tx) =>
       (await tx.execute(sql`
         select b.id, b.partner_id, pp.display_name as partner_name, b.scheduled_date,
-               b.selected_duration, b.price_paise, b.status, b.fan_ready_at, b.meeting_id
+               b.selected_duration, b.price_paise, b.status, b.fan_ready_at, b.meeting_id,
+               -- Is there a call the fan can actually join RIGHT NOW.
+               --
+               -- The client used to derive this from meeting_id, which is wrong:
+               -- rpc_partner_initiate_call sets bookings.meeting_id with
+               -- COALESCE(b.meeting_id, ...) so attempts can reuse one room, and
+               -- nothing ever clears it. After the first attempt it stays set for
+               -- the life of the booking, so the fan was shown "Join call now"
+               -- permanently -- an action that fails with NO_ACTIVE_CALL -- and
+               -- could never reach "I'm ready", the only control that re-summons
+               -- the creator. Legacy computed this server-side too
+               -- (vw_fan_my_video_calls.can_join_call), a view never ported here.
+               exists (
+                 select 1 from public.calls c
+                  where c.booking_id = b.id
+                    and c.attempt_status in ('PARTNER_INITIATED','IN_PROGRESS')
+               ) as can_join_call,
+               -- How the most recent attempt ended, so the fan can be told why
+               -- their ready flag was cleared (trg_reset_fan_ready) instead of it
+               -- silently reverting.
+               (select c.attempt_status::text from public.calls c
+                 where c.booking_id = b.id
+                 order by c.partner_initiated_at desc nulls last limit 1) as last_call_status
         from public.bookings b join public.partner_profiles pp on pp.profile_id = b.partner_id
         where b.fan_id = ${userId} order by b.created_at desc
       `)) as unknown as any[]);
