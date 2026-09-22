@@ -4,6 +4,14 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { createRemoteJWKSet, jwtVerify, JWTPayload } from 'jose';
 
+/** A verified access token: the subject, and its expiry in epoch seconds. */
+export interface VerifiedToken {
+  id: string;
+  email?: string;
+  /** Epoch seconds. Absent only if the provider issued a token with no expiry. */
+  exp?: number;
+}
+
 /**
  * Verifies the managed-auth (Supabase Auth / Clerk) access token against the
  * provider's JWKS. We RENT auth — the API only verifies; it never issues or
@@ -37,13 +45,26 @@ export class JwtGuard implements CanActivate {
     const req = ctx.switchToHttp().getRequest();
     const auth: string | undefined = req.headers['authorization'];
     if (!auth?.startsWith('Bearer ')) throw new UnauthorizedException('Missing bearer token');
+    const { id, email } = await this.verify(auth.slice(7));
+    req.user = { id, email };
+    return true;
+  }
+
+  /**
+   * Verifies an access token and returns who it belongs to and when it stops
+   * being valid. The single place a token is trusted: the HTTP guard above and
+   * the realtime socket handshake (src/realtime) both go through it, so a socket
+   * can never accept a token the REST API would refuse. `exp` (epoch seconds)
+   * lets a long-lived connection be closed the moment its token lapses instead
+   * of outliving it.
+   */
+  async verify(token: string): Promise<VerifiedToken> {
     try {
-      const { payload } = await jwtVerify(auth.slice(7), this.jwks, {
+      const { payload } = await jwtVerify(token, this.jwks, {
         issuer: this.issuer,
         audience: this.audience,
       });
-      req.user = this.toUser(payload);
-      return true;
+      return { ...this.toUser(payload), exp: payload.exp };
     } catch (e) {
       throw new UnauthorizedException(this.describe(e));
     }

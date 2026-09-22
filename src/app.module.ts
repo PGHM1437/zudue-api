@@ -23,6 +23,7 @@ import { EarningsModule } from './earnings/earnings.module';
 import { NotificationsModule } from './notifications/notifications.module';
 import { TrustModule } from './trust/trust.module';
 import { JobsModule } from './jobs/jobs.module';
+import { RealtimeModule } from './realtime/realtime.module';
 import { AdminDashboardModule } from './admin/admin-dashboard.module';
 import { AdminPeopleModule } from './admin/admin-people.module';
 import { AdminFinanceModule } from './admin/admin-finance.module';
@@ -60,6 +61,8 @@ import { AdminSettingsModule } from './admin/admin-settings.module';
     AdminSettingsModule,
     // background
     JobsModule,
+    // live call-state events over a WebSocket (see src/realtime/README.md)
+    RealtimeModule,
   ],
   providers: [{ provide: APP_GUARD, useClass: ThrottleGuard }],
 })

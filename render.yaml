@@ -27,6 +27,20 @@ services:
       - key: DATABASE_URL
         value: postgresql://postgres.jlmmpdupapuknhsnudeu:Zudue_live123@aws-1-ap-south-1.pooler.supabase.com:6543/postgres
 
+      # ── Realtime (live call-state events over a WebSocket) ────────────
+      # LISTEN needs a SESSION-level Postgres connection. DATABASE_URL above is the
+      # :6543 TRANSACTION pooler, where LISTEN "succeeds" and then never delivers —
+      # so this must be the session-mode URL (same pooler host, port 5432) or the
+      # direct connection. Set it in the Render dashboard: it carries the DB
+      # password. Unset or wrong, realtime simply stays off (the API logs exactly
+      # why and refuses sockets with 503) and push + polling carry on unchanged.
+      # See src/realtime/README.md.
+      - key: DATABASE_URL_LISTEN
+        sync: false
+      # Kill switch: 'false' stops the listener and refuses every socket.
+      - key: REALTIME_ENABLED
+        value: 'true'
+
       # ── Auth ──────────────────────────────────────────────────────────
       # Verified: the JWKS endpoint serves an ES256 (EC P-256) key, so the
       # API's asymmetric verification path is correct for this project.

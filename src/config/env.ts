@@ -13,6 +13,20 @@ const schema = z.object({
   //   'bullmq' — the legacy in-process BullMQ worker. Needs REDIS_URL AND a
   //     web service that never sleeps.
   JOBS_DRIVER: z.enum(['pgcron', 'bullmq']).default('pgcron'),
+  // Realtime gateway (src/realtime): call-state events pushed over a WebSocket
+  // instead of waiting on a poll.
+  //
+  // DATABASE_URL_LISTEN must be a SESSION-level connection to Postgres — the
+  // direct URL, or Supabase's session-mode pooler (port 5432). It must NOT be a
+  // transaction-mode pooler (Supabase port 6543, PgBouncer transaction mode):
+  // LISTEN "succeeds" there but notifications are never delivered. Unset falls
+  // back to DATABASE_URL, which is only right if that one is not a transaction
+  // pooler; the gateway probes end-to-end at boot and refuses sockets (503)
+  // rather than run silently deaf, so a wrong value is loud, not silent.
+  DATABASE_URL_LISTEN: z.string().url().optional(),
+  // Kill switch. 'false' stops the listener and rejects every upgrade; clients
+  // fall back to the push + polling paths that still run underneath.
+  REALTIME_ENABLED: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
   AUTH_JWKS_URL: z.string().url(),
   AUTH_ISSUER: z.string(),
   AUTH_AUDIENCE: z.string().default('authenticated'),

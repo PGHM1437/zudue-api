@@ -142,15 +142,22 @@ export class PushService {
    * shown "Call complete. Your booked call time is complete." The outcome card
    * is the only place either party learns how the call resolved, so it must
    * carry the truth, not the happy case.
+   *
+   * `endedByRole` ('FAN' | 'PARTNER', optional): who manually ended a live
+   * call, when the server RPC could attribute it (see migration 0101). Not
+   * set for a deadline completion or a still-ringing miss — those are not
+   * "ended by" anyone. Travels in the same data payload so the receiving
+   * client can say "The creator ended the call" instead of a bare status.
    */
-  async notifyCallEnded(recipientIds: string[], callId: string, bookingId: string, status: string) {
+  async notifyCallEnded(recipientIds: string[], callId: string, bookingId: string, status: string, endedByRole?: string | null) {
     const ids = [...new Set(recipientIds.filter(Boolean))];
     if (!ids.length) return;
     await this.db.runAsService(async (tx) => {
       const rows = (await tx.execute(sql`
         select fcm_token, onesignal_player_id, platform from public.push_tokens where profile_id = any(${ids})
       `)) as unknown as Array<{ fcm_token: string | null; onesignal_player_id: string | null; platform: string | null }>;
-      const data = { type: 'call_ended', callId, bookingId, status };
+      const data: Record<string, string> = { type: 'call_ended', callId, bookingId, status };
+      if (endedByRole) data.endedByRole = endedByRole;
       const fcmTokens = rows
         .filter((r): r is typeof r & { fcm_token: string } => !!r.fcm_token)
         .map((r) => ({ token: r.fcm_token, platform: r.platform ?? undefined }));

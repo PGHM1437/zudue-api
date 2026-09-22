@@ -406,7 +406,7 @@ class CallsService {
           // Send THAT, so the other party's outcome card matches the money.
           const status = res.completed === false ? 'DROPPED_TECHNICAL_ISSUE' : 'COMPLETED_SUCCESSFUL';
           this.push
-            .notifyCallEnded([rows[0].fan_id, rows[0].partner_id], callId, rows[0].booking_id, status)
+            .notifyCallEnded([rows[0].fan_id, rows[0].partner_id], callId, rows[0].booking_id, status, res.ended_by_role as string | undefined)
             .catch(() => undefined);
         }
       }
@@ -433,10 +433,15 @@ class CallsService {
         const rows = (await tx.execute(sql`select fan_id, partner_id, booking_id from public.calls where id = ${callId}`)) as unknown as Array<{ fan_id: string; partner_id: string; booking_id: string }>;
         if (rows[0]) {
           this.push.cancelCall(rows[0].fan_id, callId).catch(() => undefined);
+          // ended_by_role (0101): only set when this resolved a manual
+          // technical-issue report on a call that was already IN_PROGRESS —
+          // null for a still-ringing MISSED_FAN_* outcome, which is a
+          // pre-acceptance event with no "who ended it" to attribute.
+          const endedByRole = res.ended_by_role as string | undefined;
           // If both were mid-call (a technical drop), the partner's screen is
           // still open — end it now. Also a no-op for a fan who was only ringing.
           this.push
-            .notifyCallEnded([rows[0].fan_id, rows[0].partner_id], callId, rows[0].booking_id, status)
+            .notifyCallEnded([rows[0].fan_id, rows[0].partner_id], callId, rows[0].booking_id, status, endedByRole)
             .catch(() => undefined);
 
           // Persist a missed-call notification so the fan sees it even if
@@ -447,10 +452,37 @@ class CallsService {
               actorId: userId,
               eventType: 'VIDEO_CALL_MISSED_ATTEMPT_FAN',
               title: 'Missed Video Call',
-              message: 'You missed a video call. The partner tried to reach you.',
+              message: "You missed a video call. Tap to set your 'I am Ready' status so partners know you're available.",
               relatedEntityType: 'call',
               relatedEntityId: callId,
               metadata: { bookingId: rows[0].booking_id, callId, status },
+            });
+          } else if (status === 'DROPPED_TECHNICAL_ISSUE' && endedByRole) {
+            // A participant reported an issue on a call that was already
+            // live — previously this fired only a transient push with no
+            // persisted record for either party. Give both a durable one,
+            // worded for who acted.
+            await this.createCallNotification(tx, {
+              recipientId: rows[0].fan_id,
+              actorId: userId,
+              eventType: 'VIDEO_CALL_MISSED_ATTEMPT_FAN',
+              title: 'Call ended early',
+              message: endedByRole === 'FAN'
+                ? 'You ended the call early. Your booking is still active — mark yourself ready to try again.'
+                : 'The creator ended the call early. Your booking is still active — mark yourself ready to try again.',
+              relatedEntityType: 'call',
+              relatedEntityId: callId,
+              metadata: { bookingId: rows[0].booking_id, callId, status, endedByRole },
+            });
+            await this.createCallNotification(tx, {
+              recipientId: rows[0].partner_id,
+              actorId: userId,
+              eventType: 'VIDEO_CALL_COMPLETED_PARTNER',
+              title: 'Call ended early',
+              message: endedByRole === 'PARTNER' ? 'You ended the call early.' : 'The fan ended the call early.',
+              relatedEntityType: 'call',
+              relatedEntityId: callId,
+              metadata: { bookingId: rows[0].booking_id, callId, status, endedByRole },
             });
           }
         }
